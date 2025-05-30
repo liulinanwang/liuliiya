@@ -58,7 +58,7 @@ def configure_chinese_font():
     available_fonts = [f.name for f in fm.fontManager.ttflist]
     chinese_font = None
     for font in font_list:
-        if font in available_fonts:da
+        if font in available_fonts:
             chinese_font = font
             break
     if chinese_font:
@@ -299,7 +299,7 @@ class SelfAttention1D(nn.Module):
 
         self.gamma = nn.Parameter(torch.zeros(1))
 
-    def forward(self, x):
+    def forward(self, x):ol
         batch_size, channels, length = x.size()
 
         q = self.query(x).view(batch_size, -1, length).permute(0, 2, 1)
