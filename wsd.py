@@ -58,7 +58,7 @@ def configure_chinese_font():
     available_fonts = [f.name for f in fm.fontManager.ttflist]
     chinese_font = None
     for font in font_list:
-        if font in available_fonts:
+        if font in available_fonts:da
             chinese_font = font
             break
     if chinese_font:
