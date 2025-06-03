@@ -1,6 +1,5 @@
 import numpy as np
 import scipy.io as sio
-from scipy import linalg
 from scipy.interpolate import interp1d
 import pywt
 import torch
@@ -32,21 +31,22 @@ STEP = int(SEGMENT_LENGTH * (1 - OVERLAP))
 if STEP < 1: STEP = 1
 DEFAULT_WAVELET = 'db4'
 DEFAULT_WAVELET_LEVEL = 3
-AE_LATENT_DIM = 32
-AE_EPOCHS = 5
+AE_LATENT_DIM = 64
+AE_EPOCHS = 30
 AE_LR = 0.001
 AE_BATCH_SIZE = 64
 AE_CONTRASTIVE_WEIGHT = 1.2
 AE_NOISE_STD = 0.05
 CNN_EPOCHS = 3
 CNN_LR = 0.001
-SEN_EPOCHS = 5
-SEN_LR = 0.0005
+SAE_EPOCHS = 50
+SAE_LR = 0.0005
+SAE_MU = 1.0
 CNN_FEATURE_DIM = 256
 DEFAULT_BATCH_SIZE = 128
+# --- New Global Constant for Sampling Frequency ---
+SAMPLING_FREQUENCY_HZ = 10000 # Your dataset sampling rate is 10 kHz
 
-MIN_SEPARATION_RATIO = 3.0   # 类间距离/类内距离应大于3
-MIN_CLASSIFICATION_ACC = 0.95 # 潜在空间分类准确率应大于95%
 def configure_chinese_font():
     """确保matplotlib正确配置中文字体"""
     import matplotlib.pyplot as plt
@@ -105,7 +105,8 @@ def create_segments(signal_data, segment_length, step):
 
 
 class DataPreprocessor:
-    def __init__(self, sample_length=SEGMENT_LENGTH, overlap=OVERLAP, augment=True, random_seed=42):
+    def __init__(self, sample_length=SEGMENT_LENGTH, overlap=OVERLAP, augment=True, random_seed=42,
+                 sampling_frequency=SAMPLING_FREQUENCY_HZ):
         self.sample_length = sample_length
         self.overlap = overlap
         self.augment = augment
@@ -114,6 +115,7 @@ class DataPreprocessor:
         self.scaler = MinMaxScaler(feature_range=(-1, 1))
         self.random_seed = random_seed
         np.random.seed(self.random_seed)
+        self.sampling_frequency = sampling_frequency  # Store sampling frequency
 
     def cubic_spline_interpolation(self, signal_with_missing):
         """使用三次样条插值法处理缺失值 (Improved fallback)"""
@@ -206,8 +208,58 @@ class DataPreprocessor:
         """Uses the helper create_segments function."""
         return create_segments(signal_data, self.sample_length, self.stride)
 
+    def _calculate_frequency_ratios(self, signal_segment):
+        """
+        Calculates HF_ratio and LF_ratio for a single signal segment.
+        Assumes signal_segment is already preprocessed (e.g., denoised, filtered).
+        """
+        if len(signal_segment) == 0:
+            return 0.0, 0.0
+
+        # Nfft is usually power of 2, often equal to segment length for simplicity
+        Nfft = len(signal_segment)
+        Fs = self.sampling_frequency
+
+        # Perform FFT
+        X = np.fft.fft(signal_segment, n=Nfft)
+
+        # Calculate Power Spectrum (consider only the positive frequencies)
+        P = (1 / Nfft) * np.abs(X) ** 2
+        P = P[:Nfft // 2 + 1]  # Take only the first half
+
+        # Frequency resolution
+        Delta_f = Fs / Nfft
+
+        # Define frequency band indices based on 10 kHz Fs
+        # LF: 0 Hz - 1 kHz
+        kLF_start = 0
+        kLF_end = int(np.floor(1000 / Delta_f))
+
+        # HF: 3 kHz - 5 kHz (max frequency is Fs/2 = 5 kHz for 10 kHz Fs)
+        # Assuming we care about 3-5 kHz, as 6 kHz is beyond Nyquist for 12kHz Fs in original
+        # For 10kHz Fs, Nyquist is 5kHz. So HF should be 3kHz-5kHz.
+        kHF_start = int(np.ceil(3000 / Delta_f))
+        kHF_end = Nfft // 2  # Corresponds to Fs/2 = 5 kHz
+
+        # Ensure indices are within bounds
+        kLF_end = min(kLF_end, Nfft // 2)
+        kHF_start = min(kHF_start, Nfft // 2)
+        kHF_end = min(kHF_end, Nfft // 2)
+
+        # Accumulate energies
+        E_LF = np.sum(P[kLF_start: kLF_end + 1])
+        E_HF = np.sum(P[kHF_start: kHF_end + 1])
+        E_total = np.sum(P)  # Sum of all positive frequencies
+
+        epsilon = 1e-8  # For numerical stability
+
+        LF_ratio = (E_LF + epsilon) / (E_total + epsilon)
+        HF_ratio = (E_HF + epsilon) / (E_total + epsilon)
+
+        return HF_ratio, LF_ratio
+
     def preprocess(self, signal_data, augmentation=False, scale_globally=False):
-        """改进的预处理流程，防止数据泄露"""
+        """改进的预处理流程，防止数据泄露。返回处理后的信号段及对应的HF/LF ratios。"""
         # 初始NaN检查
         if not np.all(np.isfinite(signal_data)):
             signal_data = np.nan_to_num(signal_data, nan=np.nanmean(signal_data),
@@ -217,810 +269,281 @@ class DataPreprocessor:
         signal_data = self.remove_outliers_sigma(signal_data)
         signal_data = self.wavelet_denoising_universal(signal_data)
 
+        # Scale globally on the whole signal before segmentation
         if scale_globally:
-            segments = self.segment_signal(signal_data)
-            if segments.shape[0] == 0:
-                return np.empty((0, self.sample_length))
-
-            segments_flat = segments.reshape(-1, 1)
-            normalized_flat = self.scaler.fit_transform(segments_flat)
-            signal_data_normalized = normalized_flat.reshape(segments.shape)
-        else:
             signal_data_reshaped = signal_data.reshape(-1, 1)
             signal_data_normalized = self.scaler.fit_transform(signal_data_reshaped).flatten()
-            signal_data_normalized = self.segment_signal(signal_data_normalized)
+        else:  # Scale segment by segment (current default)
+            signal_data_normalized = signal_data  # Scaling will be applied to segments
 
-        if not augmentation or not self.augment:
-            return signal_data_normalized
+        # Create segments
+        segments = self.segment_signal(signal_data_normalized if scale_globally else signal_data)
 
-        processed_signals = [signal_data_normalized]
+        if segments.shape[0] == 0:
+            return np.empty((0, self.sample_length)), np.empty((0, 2))
 
-        aug_seed = self.random_seed + 1
+        # Calculate HF/LF ratios for each segment BEFORE augmentation
+        hf_lf_ratios = []
+        for segment in segments:
+            # Re-scale segment-by-segment if not scaled globally
+            if not scale_globally:
+                segment = self.scaler.fit_transform(segment.reshape(-1, 1)).flatten()
+            hf, lf = self._calculate_frequency_ratios(segment)
+            hf_lf_ratios.append([hf, lf])
+        hf_lf_ratios = np.array(hf_lf_ratios, dtype=np.float32)
 
-        for i in range(2):
-            np.random.seed(aug_seed + i)
-            noise_std = 0.01 + 0.01 * i
-            noise_segments = []
+        # Store original (processed and optionally scaled) segments for augmentation base
+        base_segments = segments.copy()
+        base_hf_lf_ratios = hf_lf_ratios.copy()
 
-            for segment in signal_data_normalized:
-                noisy_seg = segment + np.random.normal(0, noise_std, len(segment))
-                noisy_seg = np.clip(noisy_seg, -1.0, 1.0)
-                noise_segments.append(noisy_seg)
+        processed_segments_list = [base_segments]
+        processed_hf_lf_ratios_list = [base_hf_lf_ratios]
 
-            if noise_segments:
-                processed_signals.append(np.array(noise_segments))
+        if augmentation and self.augment:
+            aug_seed = self.random_seed + 1
+            # a) 噪声增强
+            for i in range(2):
+                np.random.seed(aug_seed + i)
+                noise_std = AE_NOISE_STD + 0.01 * i  # Use global AE_NOISE_STD
+                noise_segments = []
+                noise_hf_lf_ratios = []
+                for j, segment in enumerate(base_segments):
+                    noisy_seg = segment + np.random.normal(0, noise_std, len(segment))
+                    noisy_seg = np.clip(noisy_seg, -1.0, 1.0)
+                    noise_segments.append(noisy_seg)
+                    # Re-calculate HF/LF for noisy segments
+                    hf, lf = self._calculate_frequency_ratios(noisy_seg)
+                    noise_hf_lf_ratios.append([hf, lf])
+                if noise_segments:
+                    processed_segments_list.append(np.array(noise_segments))
+                    processed_hf_lf_ratios_list.append(np.array(noise_hf_lf_ratios))
 
-        for i in range(2):
-            np.random.seed(aug_seed + 10 + i)
-            shift_segments = []
+            # b) 时间平移增强
+            for i in range(2):
+                np.random.seed(aug_seed + 10 + i)
+                shift_segments = []
+                shift_hf_lf_ratios = []
+                for j, segment in enumerate(base_segments):
+                    max_shift = len(segment) // 10
+                    shift_amount = np.random.randint(-max_shift, max_shift + 1)
+                    if shift_amount != 0:
+                        shifted_seg = np.roll(segment, shift_amount)
+                    else:
+                        shifted_seg = segment.copy()
+                    shift_segments.append(shifted_seg)
+                    # Re-calculate HF/LF for shifted segments
+                    hf, lf = self._calculate_frequency_ratios(shifted_seg)
+                    shift_hf_lf_ratios.append([hf, lf])
+                if shift_segments:
+                    processed_segments_list.append(np.array(shift_segments))
+                    processed_hf_lf_ratios_list.append(np.array(shift_hf_lf_ratios))
 
-            for segment in signal_data_normalized:
-                max_shift = len(segment) // 10
-                shift_amount = np.random.randint(-max_shift, max_shift + 1)
-                if shift_amount != 0:
-                    shifted_seg = np.roll(segment, shift_amount)
-                else:
-                    shifted_seg = segment.copy()
-                shift_segments.append(shifted_seg)
+            # c) 幅值缩放增强
+            for i in range(2):
+                np.random.seed(aug_seed + 20 + i)
+                scale_segments = []
+                scale_hf_lf_ratios = []
+                for j, segment in enumerate(base_segments):
+                    scale_factor = 0.95 + 0.1 * np.random.random()
+                    scaled_seg = segment * scale_factor
+                    scaled_seg = np.clip(scaled_seg, -1.0, 1.0)
+                    scale_segments.append(scaled_seg)
+                    # Re-calculate HF/LF for scaled segments
+                    hf, lf = self._calculate_frequency_ratios(scaled_seg)
+                    scale_hf_lf_ratios.append([hf, lf])
+                if scale_segments:
+                    processed_segments_list.append(np.array(scale_segments))
+                    processed_hf_lf_ratios_list.append(np.array(scale_hf_lf_ratios))
 
-            if shift_segments:
-                processed_signals.append(np.array(shift_segments))
+        if not processed_segments_list:
+            return np.empty((0, self.sample_length)), np.empty((0, 2))
 
-        # c) 幅值缩放增强
-        for i in range(2):
-            np.random.seed(aug_seed + 20 + i)
-            scale_segments = []
+        final_segments = np.vstack(processed_segments_list)
+        final_hf_lf_ratios = np.vstack(processed_hf_lf_ratios_list)
 
-            for segment in signal_data_normalized:
-                scale_factor = 0.95 + 0.1 * np.random.random()
-                scaled_seg = segment * scale_factor
-                scaled_seg = np.clip(scaled_seg, -1.0, 1.0)
-                scale_segments.append(scaled_seg)
-
-            if scale_segments:
-                processed_signals.append(np.array(scale_segments))
-
-        if not processed_signals:
-            return np.empty((0, self.sample_length))
-
-        return np.vstack(processed_signals)
-
-
-class SelfAttention1D(nn.Module):
-    """1D自注意力模块"""
-
-    def __init__(self, channels, reduction=8):
-        super().__init__()
-        self.channels = channels
-
-        self.query = nn.Conv1d(channels, channels // reduction, 1)
-        self.key = nn.Conv1d(channels, channels // reduction, 1)
-        self.value = nn.Conv1d(channels, channels, 1)
-
-        self.gamma = nn.Parameter(torch.zeros(1))
-
-    def forward(self, x):ol
-        batch_size, channels, length = x.size()
-
-        q = self.query(x).view(batch_size, -1, length).permute(0, 2, 1)
-        k = self.key(x).view(batch_size, -1, length)
-        v = self.value(x).view(batch_size, -1, length)
-
-        attention = torch.bmm(q, k)
-        attention = F.softmax(attention, dim=-1)
-
-        out = torch.bmm(v, attention.permute(0, 2, 1))
-        out = out.view(batch_size, channels, length)
-
-        return self.gamma * out + x
+        return final_segments, final_hf_lf_ratios
 
 
-class EnhancedAutoencoder(nn.Module):
+class ContrastiveAutoencoder(nn.Module):
     """
-    修复版自编码器：1024输入 → 32维潜在空间 → 1024重建
+    1D 卷积编码器 + 全连接解码器的自编码器，
+    重构输入长度，并在 latent 空间应用有监督对比损失。
     """
 
-    def __init__(self, input_length=1024, latent_dim=32, num_classes=4):
+    def __init__(self, input_length: int = 1024, latent_dim: int = 64):
         super().__init__()
         self.input_length = input_length
         self.latent_dim = latent_dim
-        self.num_classes = num_classes
 
-        # === 编码器：1024 → 32 ===
+        # --- Encoder: 3x Conv1d ↓ length by /2 each time ---
         self.encoder = nn.Sequential(
-            # 1024 → 512
-            nn.Conv1d(1, 64, kernel_size=15, stride=2, padding=7),
-            nn.BatchNorm1d(64),
+            nn.Conv1d(1, 32, kernel_size=9, stride=2, padding=4),  # L -> L/2
+            nn.BatchNorm1d(32),
             nn.LeakyReLU(0.1),
-            nn.Dropout(0.1),
 
-            SelfAttention1D(64),
-
-            # 512 → 256
-            nn.Conv1d(64, 128, kernel_size=11, stride=2, padding=5),
-            nn.BatchNorm1d(128),
-            nn.LeakyReLU(0.1),
-            nn.Dropout(0.1),
-
-            SelfAttention1D(128),
-
-            # 256 → 128
-            nn.Conv1d(128, 256, kernel_size=7, stride=2, padding=3),
-            nn.BatchNorm1d(256),
-            nn.LeakyReLU(0.1),
-            nn.Dropout(0.1),
-
-            # 128 → 64
-            nn.Conv1d(256, 512, kernel_size=5, stride=2, padding=2),
-            nn.BatchNorm1d(512),
-            nn.LeakyReLU(0.1),
-            nn.Dropout(0.1),
-
-            # 全局池化
-            nn.AdaptiveAvgPool1d(1),
-            nn.Flatten()
-        )
-
-        # === 潜在空间映射 ===
-        self.to_latent = nn.Sequential(
-            nn.Linear(512, 128),
-            nn.BatchNorm1d(128),
-            nn.LeakyReLU(0.1),
-            nn.Dropout(0.2),
-
-            nn.Linear(128, 64),
-            nn.BatchNorm1d(64),
-            nn.LeakyReLU(0.1),
-            nn.Dropout(0.2),
-
-            nn.Linear(64, latent_dim)
-        )
-
-        # === 解码器：32 → 1024 ===
-        self.from_latent = nn.Sequential(
-            nn.Linear(latent_dim, 64),
+            nn.Conv1d(32, 64, kernel_size=7, stride=2, padding=3),  # L/2 -> L/4
             nn.BatchNorm1d(64),
             nn.LeakyReLU(0.1),
 
-            nn.Linear(64, 128),
+            nn.Conv1d(64, 128, kernel_size=5, stride=2, padding=2),  # L/4 -> L/8
             nn.BatchNorm1d(128),
             nn.LeakyReLU(0.1),
 
-            nn.Linear(128, 512),
-            nn.BatchNorm1d(512),
-            nn.LeakyReLU(0.1),
-
-            # 映射到合适的尺寸用于卷积
-            nn.Linear(512, 512 * 64),  # 512 channels × 64 length
-            nn.LeakyReLU(0.1)
+            nn.AdaptiveAvgPool1d(1),  # -> [B,128,1]
+            nn.Flatten(),  # -> [B,128]
+            nn.Linear(128, latent_dim)  # -> [B, latent_dim]
         )
 
+        # --- Decoder: 全连接直接重构到原始长度 ---
         self.decoder = nn.Sequential(
-            # 重塑为卷积格式: [B, 512*64] → [B, 512, 64]
-            nn.Unflatten(1, (512, 64)),
-
-            # 64 → 128
-            nn.ConvTranspose1d(512, 256, kernel_size=5, stride=2, padding=2, output_padding=1),
-            nn.BatchNorm1d(256),
+            nn.Linear(latent_dim, 128),
             nn.LeakyReLU(0.1),
-
-            # 128 → 256
-            nn.ConvTranspose1d(256, 128, kernel_size=7, stride=2, padding=3, output_padding=1),
-            nn.BatchNorm1d(128),
-            nn.LeakyReLU(0.1),
-
-            # 256 → 512
-            nn.ConvTranspose1d(128, 64, kernel_size=11, stride=2, padding=5, output_padding=1),
-            nn.BatchNorm1d(64),
-            nn.LeakyReLU(0.1),
-
-            # 512 → 1024
-            nn.ConvTranspose1d(64, 1, kernel_size=15, stride=2, padding=7, output_padding=1),
+            nn.Linear(128, input_length),
             nn.Tanh()
         )
 
-        # 初始化类中心
-        self.register_buffer('class_centers', torch.randn(num_classes, latent_dim))
-
-        self._init_weights()
-
-    def _init_weights(self):
-        """权重初始化"""
-        for m in self.modules():
-            if isinstance(m, (nn.Conv1d, nn.ConvTranspose1d, nn.Linear)):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='leaky_relu')
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.BatchNorm1d):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
-
-    def encode(self, x):
-        """编码到32维潜在空间"""
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: [B, L] or [B,1,L] -> recon [B, L]
+        """
         if x.dim() == 2:
-            x = x.unsqueeze(1)  # [B, L] → [B, 1, L]
+            x = x.unsqueeze(1)  # -> [B,1,L]
+        z = self.encode(x)
+        recon = self.decode(z)
+        return recon
 
-        features = self.encoder(x)  # [B, 512]
-        latent = self.to_latent(features)  # [B, 32]
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        """返回 [B, latent_dim]"""
+        if x.dim() == 2:
+            x = x.unsqueeze(1)
+        z = self.encoder(x)
+        return z
 
-        return latent
-
-    def decode(self, latent):
-        """从32维潜在空间重建"""
-        features = self.from_latent(latent)  # [B, 512*64]
-        reconstructed = self.decoder(features)  # [B, 1, 1024]
-
-        return reconstructed.squeeze(1)  # [B, 1024]
-
-    def forward(self, x):
-        """完整的编码-解码过程"""
-        latent = self.encode(x)
-        reconstructed = self.decode(latent)
-        return reconstructed, latent
-
-    def update_class_centers(self, latent_features, labels, momentum=0.9):
-        """更新类中心"""
-        with torch.no_grad():
-            for class_idx in range(self.num_classes):
-                mask = (labels == class_idx)
-                if mask.sum() > 0:
-                    class_features = latent_features[mask]
-                    new_center = class_features.mean(dim=0)
-
-                    self.class_centers[class_idx] = (
-                            momentum * self.class_centers[class_idx] +
-                            (1 - momentum) * new_center
-                    )
+    def decode(self, z: torch.Tensor) -> torch.Tensor:
+        """
+        从 [B, latent_dim] 重构到 [B, input_length]
+        """
+        recon = self.decoder(z)
+        return recon  # [B, L]
 
 
-class EnhancedContrastiveLoss(nn.Module):
-    """修复版增强对比损失函数 - 确保所有损失为非负"""
+class SupervisedContrastiveLoss(nn.Module):
+    """
+    有监督对比损失，将同类拉近、异类推远。
+    """
 
-    def __init__(self, latent_dim=32, num_classes=4, temperature=0.5, margin=1.0):
+    def __init__(self, temperature: float = 0.1):
         super().__init__()
-        self.latent_dim = latent_dim
-        self.num_classes = num_classes
-        self.temperature = temperature  # 增大温度参数，避免数值不稳定
-        self.margin = margin
+        self.temperature = temperature
 
-        self.mse_loss = nn.MSELoss()
-
-    def center_loss(self, features, labels, centers):
-        """中心损失 - 确保非负"""
-        centers_batch = centers[labels]
-        center_loss = F.mse_loss(features, centers_batch)
-        return center_loss
-
-    def supervised_contrastive_loss(self, features, labels):
-        """
-        修正版监督对比损失 - 基于SimCLR，确保非负
-        """
+    def forward(self, features: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        device = features.device
         batch_size = features.size(0)
-        if batch_size < 2:
-            return torch.tensor(0.0, device=features.device, requires_grad=True)
 
-        # L2归一化
-        features_norm = F.normalize(features, p=2, dim=1)
+        # L2 归一化
+        features = F.normalize(features, p=2, dim=1)
+        sim = torch.mm(features, features.T) / self.temperature
 
-        # 计算相似度矩阵
-        similarity_matrix = torch.matmul(features_norm, features_norm.T) / self.temperature
-
-        # 为数值稳定性，减去最大值
-        similarity_matrix = similarity_matrix - torch.max(similarity_matrix, dim=1, keepdim=True)[0].detach()
-
-        # 创建标签掩码
         labels = labels.view(-1, 1)
-        mask = torch.eq(labels, labels.T).float()
+        mask = torch.eq(labels, labels.T).float().to(device)
+        mask = mask - torch.eye(batch_size, device=device)
 
-        # 移除对角线元素（自己与自己的相似度）
-        logits_mask = torch.ones_like(mask) - torch.eye(batch_size, device=features.device)
-        mask = mask * logits_mask
+        exp_sim = torch.exp(sim)
+        pos_sum = (exp_sim * mask).sum(dim=1)
+        total_sum = exp_sim.sum(dim=1) - torch.exp(torch.diag(sim))
 
-        # 计算exp值
-        exp_logits = torch.exp(similarity_matrix) * logits_mask
-
-        # 计算log_prob
-        log_prob = similarity_matrix - torch.log(exp_logits.sum(dim=1, keepdim=True) + 1e-8)
-
-        # 计算每个样本的正样本平均log概率
-        mean_log_prob_pos = (mask * log_prob).sum(dim=1) / (mask.sum(dim=1) + 1e-8)
-
-        # 损失为负的平均log概率
-        loss = -mean_log_prob_pos.mean()
-
-        return loss
-
-    def triplet_loss_fixed(self, features, labels):
-        """
-        修正版三元组损失 - 确保非负
-        """
-        batch_size = features.size(0)
-        if batch_size < 3:
-            return torch.tensor(0.0, device=features.device, requires_grad=True)
-
-        # 计算欧氏距离矩阵
-        dist_matrix = torch.cdist(features, features, p=2)
-
-        triplet_losses = []
-
-        for i in range(batch_size):
-            anchor_label = labels[i]
-
-            # 找正样本（同类，除了自己）
-            pos_mask = (labels == anchor_label) & (torch.arange(batch_size, device=features.device) != i)
-            if pos_mask.sum() == 0:
-                continue
-
-            # 找负样本（异类）
-            neg_mask = (labels != anchor_label)
-            if neg_mask.sum() == 0:
-                continue
-
-            # 最难的正样本（距离最远的同类样本）
-            hardest_pos_dist = dist_matrix[i][pos_mask].max()
-
-            # 最难的负样本（距离最近的异类样本）
-            hardest_neg_dist = dist_matrix[i][neg_mask].min()
-
-            # 三元组损失：max(0, pos_dist - neg_dist + margin)
-            triplet_loss = F.relu(hardest_pos_dist - hardest_neg_dist + self.margin)
-            triplet_losses.append(triplet_loss)
-
-        if triplet_losses:
-            return torch.stack(triplet_losses).mean()
-        else:
-            return torch.tensor(0.0, device=features.device, requires_grad=True)
-
-    def inter_class_separation_loss(self, features, labels):
-        """
-        类间分离损失 - 直接最大化类中心间距离（转为最小化负距离）
-        """
-        unique_labels = torch.unique(labels)
-        if len(unique_labels) < 2:
-            return torch.tensor(0.0, device=features.device, requires_grad=True)
-
-        # 计算每个类的中心
-        class_centers = []
-        for label in unique_labels:
-            mask = (labels == label)
-            if mask.sum() > 0:
-                center = features[mask].mean(dim=0)
-                class_centers.append(center)
-
-        if len(class_centers) < 2:
-            return torch.tensor(0.0, device=features.device, requires_grad=True)
-
-        class_centers = torch.stack(class_centers)  # [num_classes, feature_dim]
-
-        # 计算类中心间的距离
-        center_dist_matrix = torch.cdist(class_centers, class_centers, p=2)
-
-        # 移除对角线，只考虑不同类间的距离
-        mask = torch.ones_like(center_dist_matrix) - torch.eye(len(class_centers), device=features.device)
-        inter_distances = center_dist_matrix * mask
-
-        # 我们希望最大化类间距离，所以最小化负距离
-        # 但为了确保损失非负，我们使用最大值减去平均距离
-        max_possible_dist = torch.sqrt(torch.tensor(features.size(1), dtype=torch.float, device=features.device))
-        avg_inter_dist = inter_distances.sum() / (mask.sum() + 1e-8)
-
-        # 分离损失：当类间距离小时，损失大
-        separation_loss = F.relu(max_possible_dist - avg_inter_dist)
-
-        return separation_loss
-
-    def forward(self, reconstructed, original, latent_features, labels, class_centers):
-        """
-        综合损失函数 - 确保所有分量非负
-        """
-        # 1. 重建损失（非负）
-        recon_loss = self.mse_loss(reconstructed, original)
-
-        # 2. 中心损失（非负）
-        center_loss = self.center_loss(latent_features, labels, class_centers)
-
-        # 3. 监督对比损失（非负）
-        contrastive_loss = self.supervised_contrastive_loss(latent_features, labels)
-
-        # 4. 三元组损失（非负）
-        triplet_loss = self.triplet_loss_fixed(latent_features, labels)
-
-        # 5. 类间分离损失（非负）
-        separation_loss = self.inter_class_separation_loss(latent_features, labels)
-
-        # 验证所有损失都是非负的
-        losses = {
-            'reconstruction': recon_loss,
-            'center': center_loss,
-            'contrastive': contrastive_loss,
-            'triplet': triplet_loss,
-            'separation': separation_loss
-        }
-
-        # 调试：检查是否有负值
-        for name, loss in losses.items():
-            if loss.item() < 0:
-                print(f"WARNING: {name} loss is negative: {loss.item()}")
-                # 将负损失设为0
-                losses[name] = torch.tensor(0.0, device=latent_features.device, requires_grad=True)
-
-        return losses
+        loss = -torch.log((pos_sum + 1e-9) / (total_sum + 1e-9))
+        return loss.mean()
 
 
-class EnhancedAETrainer:
-    """修复版增强AE训练器"""
+class AETrainer:
+    """
+    训练 ContrastiveAutoencoder，用 recon_loss + contrastive_loss。
+    """
 
-    def __init__(self, model, device=None):
+    def __init__(self, model: ContrastiveAutoencoder, device: torch.device = None):
         self.model = model
         self.device = device or torch.device("cpu")
         self.model.to(self.device)
-        self.loss_fn = EnhancedContrastiveLoss(
-            latent_dim=model.latent_dim,
-            num_classes=model.num_classes,
-            temperature=0.5,  # 增大温度参数
-            margin=1.0
-        )
+        self.recon_loss_fn = nn.MSELoss()
+        self.contrastive_loss_fn = SupervisedContrastiveLoss(temperature=0.1)
 
-    def train(self, X, y, epochs=50, batch_size=64, lr=1e-3, contrastive_weight=1.2):
-        """训练增强自编码器 - 使用修正损失函数"""
+    def train(self,
+              X: torch.Tensor,
+              y: torch.Tensor,
+              epochs: int = 30,
+              batch_size: int = 64,
+              lr: float = 1e-3,
+              contrastive_weight: float = 1.0):
         dataset = torch.utils.data.TensorDataset(X, y)
-        loader = torch.utils.data.DataLoader(
-            dataset, batch_size=batch_size, shuffle=True, drop_last=True
-        )
+        loader = torch.utils.data.DataLoader(dataset,
+                                             batch_size=batch_size,
+                                             shuffle=True,
+                                             drop_last=True)
+        optimizer = optim.Adam(self.model.parameters(), lr=lr, weight_decay=1e-5)
 
-        optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=1e-4)
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer, max_lr=lr * 1.5, steps_per_epoch=len(loader), epochs=epochs
-        )
-
-        best_separation_ratio = 0.0
-
-        for epoch in range(epochs):
+        best_metric = float('inf')
+        for epoch in range(1, epochs + 1):
             self.model.train()
-            epoch_losses = {
-                'total': 0, 'recon': 0, 'center': 0,
-                'contrast': 0, 'triplet': 0, 'separation': 0
-            }
-            num_batches = 0
-
-            for batch_x, batch_y in loader:
-                batch_x, batch_y = batch_x.to(self.device), batch_y.to(self.device)
-
+            total_recon, total_contrast, n = 0.0, 0.0, 0
+            for xb, yb in loader:
+                xb, yb = xb.to(self.device), yb.to(self.device)
                 optimizer.zero_grad()
-
-                # 前向传播
-                reconstructed, latent = self.model(batch_x)
-
-                # 验证维度
-                if reconstructed.shape != batch_x.shape:
-                    print(f"维度错误: 重建 {reconstructed.shape} vs 原始 {batch_x.shape}")
-                    continue
-
-                # 计算损失
-                losses = self.loss_fn(
-                    reconstructed, batch_x, latent, batch_y,
-                    self.model.class_centers
-                )
-
-                # 调整损失权重 - 确保平衡
-                total_loss = (
-                        1.0 * losses['reconstruction'] +  # 重建损失
-                        1.5 * losses['center'] +  # 中心损失
-                        1.0 * losses['contrastive'] +  # 对比损失
-                        1.0 * losses['triplet'] +  # 三元组损失
-                        0.5 * losses['separation']  # 分离损失
-                )
-
-                # 验证总损失非负
-                if total_loss.item() < 0:
-                    print(f"WARNING: Total loss is negative: {total_loss.item()}")
-                    print("Individual losses:")
-                    for name, loss in losses.items():
-                        print(f"  {name}: {loss.item()}")
-                    continue
-
-                # 反向传播
-                total_loss.backward()
+                recon = self.model(xb)  # [B, L]
+                loss_recon = self.recon_loss_fn(recon, xb)
+                z = self.model.encode(xb)  # [B, latent_dim]
+                loss_contrast = self.contrastive_loss_fn(z, yb)
+                loss = loss_recon + contrastive_weight * loss_contrast
+                loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 optimizer.step()
-                scheduler.step()
 
-                # 更新类中心
-                self.model.update_class_centers(latent.detach(), batch_y)
+                total_recon += loss_recon.item()
+                total_contrast += loss_contrast.item()
+                n += 1
 
-                # 记录损失
-                epoch_losses['total'] += total_loss.item()
-                epoch_losses['recon'] += losses['reconstruction'].item()
-                epoch_losses['center'] += losses['center'].item()
-                epoch_losses['contrast'] += losses['contrastive'].item()
-                epoch_losses['triplet'] += losses['triplet'].item()
-                epoch_losses['separation'] += losses['separation'].item()
-                num_batches += 1
+            avg_recon = total_recon / n if n > 0 else 0
+            avg_contrast = total_contrast / n if n > 0 else 0
+            metric = avg_recon + contrastive_weight * avg_contrast
+            print(f"[AE Epoch {epoch}/{epochs}] Recon: {avg_recon:.6f}, Contrast: {avg_contrast:.6f}")
 
-            # 计算平均损失
-            for key in epoch_losses:
-                epoch_losses[key] /= num_batches
+            # 保存最优
+            if metric < best_metric:
+                best_metric = metric
+                torch.save(self.model.state_dict(), "ae_best.pth")
 
-            # 评估潜在空间质量
-            if (epoch + 1) % 5 == 0:
-                separation_ratio = self._evaluate_latent_space_quality(X, y)
-
-                print(f"Epoch {epoch + 1}/{epochs}")
-                print(f"  Losses - Total: {epoch_losses['total']:.4f}, "
-                      f"Recon: {epoch_losses['recon']:.4f}, "
-                      f"Center: {epoch_losses['center']:.4f}")
-                print(f"  Contrast: {epoch_losses['contrast']:.4f}, "
-                      f"Triplet: {epoch_losses['triplet']:.4f}, "
-                      f"Separation: {epoch_losses['separation']:.4f}")
-                print(f"  Latent Space Separation Ratio: {separation_ratio:.4f}")
-
-                # 验证所有损失都是正数
-                all_positive = all(loss >= 0 for loss in epoch_losses.values())
-                if not all_positive:
-                    print("  ⚠️  Some losses are negative!")
-                else:
-                    print("  ✅ All losses are non-negative")
-
-                # 保存最佳模型
-                if separation_ratio > best_separation_ratio:
-                    best_separation_ratio = separation_ratio
-                    torch.save(self.model.state_dict(), "enhanced_ae_best.pth")
-                    print(f"  → Best model saved (separation: {separation_ratio:.4f})")
-
-        # 加载最佳模型
-        if best_separation_ratio > 0:
-            self.model.load_state_dict(torch.load("enhanced_ae_best.pth", map_location=self.device))
-            print(f"\nTraining complete. Best separation ratio: {best_separation_ratio:.4f}")
-
-        return self.model
-
-    def _evaluate_latent_space_quality(self, X, y):
-        """评估潜在空间质量"""
-        # ... 保持原有实现
+        # 加载最优模型
+        if os.path.exists("ae_best.pth"):
+            self.model.load_state_dict(torch.load("ae_best.pth", map_location=self.device))
         self.model.eval()
-        all_latent = []
-        all_labels = []
-
-        with torch.no_grad():
-            batch_size = 128
-            for i in range(0, len(X), batch_size):
-                batch_x = X[i:i + batch_size].to(self.device)
-                batch_y = y[i:i + batch_size].to(self.device)
-
-                latent = self.model.encode(batch_x)
-                all_latent.append(latent.cpu())
-                all_labels.append(batch_y.cpu())
-
-        all_latent = torch.cat(all_latent, dim=0).numpy()
-        all_labels = torch.cat(all_labels, dim=0).numpy()
-
-        # 计算类内和类间距离
-        intra_class_dists = []
-        inter_class_dists = []
-
-        unique_labels = np.unique(all_labels)
-        class_centers = {}
-
-        for label in unique_labels:
-            mask = all_labels == label
-            class_features = all_latent[mask]
-            class_centers[label] = np.mean(class_features, axis=0)
-
-            if len(class_features) > 1:
-                center = class_centers[label]
-                dists = np.linalg.norm(class_features - center, axis=1)
-                intra_class_dists.extend(dists)
-
-        for i, label1 in enumerate(unique_labels):
-            for label2 in unique_labels[i + 1:]:
-                dist = np.linalg.norm(class_centers[label1] - class_centers[label2])
-                inter_class_dists.append(dist)
-
-        avg_intra = np.mean(intra_class_dists) if intra_class_dists else 0
-        avg_inter = np.mean(inter_class_dists) if inter_class_dists else 1
-
-        separation_ratio = avg_inter / (avg_intra + 1e-8)
-
-        return separation_ratio
-
-
-class SemanticAutoencoder(nn.Module):
-    """
-    语义自动编码器(SAE)实现
-    学习特征空间和语义空间之间的对称投影函数
-    """
-
-    def __init__(self, feature_dim, semantic_dim, mu=1.0):
-        super().__init__()
-        self.feature_dim = feature_dim
-        self.semantic_dim = semantic_dim
-        self.mu = mu
-
-        # 投影矩阵H，初始化为随机正交矩阵
-        h_init = torch.randn(semantic_dim, feature_dim)
-        u, _, v = torch.svd(h_init)
-        # 确保尺寸匹配
-        if u.size(1) > feature_dim:
-            u = u[:, :feature_dim]
-        if v.size(0) > feature_dim:
-            v = v[:feature_dim, :]
-        h_orthogonal = torch.mm(u, v)
-
-        # 注册为模型参数
-        self.H = nn.Parameter(h_orthogonal)
-
-        # 用于PyTorch前向传播的线性层
-        self.encoder = nn.Linear(feature_dim, semantic_dim, bias=False)
-        self.decoder = nn.Linear(semantic_dim, feature_dim, bias=False)
-
-        # 初始化权重
-        with torch.no_grad():
-            self.encoder.weight.copy_(h_orthogonal)
-            self.decoder.weight.copy_(h_orthogonal.t())
-
-    def forward(self, x, mode='encode'):
-        """
-        前向传播
-        """
-        if mode == 'encode':
-            return self.encoder(x)
-        elif mode == 'decode':
-            return self.decoder(x)
-        elif mode == 'reconstruct':
-            semantic = self.encoder(x)
-            return self.decoder(semantic)
-        else:
-            raise ValueError(f"未知模式: {mode}")
-
-    def optimize_projection_matrix(self, X, A):
-        """
-        使用直接求解或梯度下降优化投影矩阵H
-        """
-        # 确保输入是numpy数组
-        if isinstance(X, torch.Tensor):
-            X = X.detach().cpu().numpy()
-        if isinstance(A, torch.Tensor):
-            A = A.detach().cpu().numpy()
-
-        print(f"优化投影矩阵 - 特征矩阵: {X.shape}, 语义矩阵: {A.shape}")
-
-        try:
-            # 尝试直接求解方法
-            return self._optimize_direct(X, A)
-        except Exception as e:
-            print(f"直接求解方法失败: {e}")
-            print("回退到梯度下降方法...")
-            return self._optimize_gradient_descent(X, A)
-
-    def _optimize_direct(self, X, A):
-        """使用直接公式求解"""
-        # 计算伪逆法 (更稳定)
-        Xt = X.T
-        H = np.linalg.lstsq(X, A, rcond=None)[0].T
-
-        # 对称化处理
-        H_sym = 0.5 * (H + H.T @ X.T @ np.linalg.pinv(A.T))
-
-        # 更新模型参数
-        with torch.no_grad():
-            H_tensor = torch.FloatTensor(H_sym)
-            self.H.copy_(H_tensor)
-            self.encoder.weight.copy_(H_tensor)
-            self.decoder.weight.copy_(H_tensor.t())
-
-        return H_sym
-
-    def _optimize_gradient_descent(self, X, A, lr=0.01, max_iter=1000, tol=1e-6):
-        """使用梯度下降优化"""
-        # 转换为张量进行梯度下降
-        X_tensor = torch.FloatTensor(X)
-        A_tensor = torch.FloatTensor(A)
-
-        # 当前H
-        H_current = self.H.detach().clone()
-
-        # 梯度下降
-        prev_loss = float('inf')
-        for i in range(max_iter):
-            # 前向计算
-            A_pred = torch.mm(X_tensor, H_current.t())
-            X_recon = torch.mm(A_tensor, H_current)
-
-            # 损失计算
-            recon_loss = torch.norm(X_tensor - X_recon, p='fro') ** 2
-            mapping_loss = torch.norm(A_tensor - A_pred, p='fro') ** 2
-            total_loss = recon_loss + self.mu * mapping_loss
-
-            # 梯度计算
-            grad_recon = -2 * torch.mm(A_tensor.t(), X_tensor - X_recon)
-            grad_mapping = -2 * torch.mm((A_tensor - A_pred).t(), X_tensor)
-            grad_total = grad_recon + self.mu * grad_mapping
-
-            # 更新
-            H_current = H_current - lr * grad_total
-
-            # 收敛检查
-            if abs(total_loss.item() - prev_loss) < tol:
-                break
-
-            prev_loss = total_loss.item()
-
-            if (i + 1) % 100 == 0:
-                print(f"  GD迭代 {i + 1}/{max_iter}: 损失 = {total_loss.item():.6f}")
-
-        # 对称化处理
-        H_sym = 0.5 * (H_current + H_current.t() @ X_tensor.t() @ torch.pinverse(A_tensor.t()))
-
-        # 更新模型参数
-        with torch.no_grad():
-            self.H.copy_(H_sym)
-            self.encoder.weight.copy_(H_sym)
-            self.decoder.weight.copy_(H_sym.t())
-
-        return H_sym.detach().cpu().numpy()
-
-    def align_weights(self):
-        """确保编码器和解码器的权重满足对称性约束"""
-        with torch.no_grad():
-            self.decoder.weight.copy_(self.encoder.weight.t())
-
-    def fit(self, X_train, A_train, max_iter=10, tol=1e-6):
-        """训练语义自动编码器"""
-        # 转换为numpy数组
-        if isinstance(X_train, torch.Tensor):
-            X_train = X_train.detach().cpu().numpy()
-        if isinstance(A_train, torch.Tensor):
-            A_train = A_train.detach().cpu().numpy()
-
-        print(f"SAE训练 - 特征矩阵: {X_train.shape}, 语义矩阵: {A_train.shape}")
-
-        # 迭代优化
-        prev_loss = float('inf')
-        for iteration in range(max_iter):
-            # 优化投影矩阵
-            H = self.optimize_projection_matrix(X_train, A_train)
-
-            # 计算损失
-            A_pred = X_train @ H.T
-            X_recon = A_train @ H
-
-            recon_loss = np.linalg.norm(X_train - X_recon, 'fro') ** 2
-            mapping_loss = np.linalg.norm(A_train - A_pred, 'fro') ** 2
-            total_loss = recon_loss + self.mu * mapping_loss
-
-            # 检查收敛
-            if abs(prev_loss - total_loss) < tol:
-                print(f"收敛于第{iteration + 1}次迭代，损失为{total_loss:.6f}")
-                break
-
-            prev_loss = total_loss
-            print(f"迭代 {iteration + 1}/{max_iter}: 总损失={total_loss:.6f}, "
-                  f"重建损失={recon_loss:.6f}, 映射损失={mapping_loss:.6f}")
-
-        # 确保权重矩阵对称性
-        self.align_weights()
-        return self
+        print("AE training complete, best model loaded.")
+        return self.model
 
 
 class AttributeSemanticMapper(nn.Module):
-    def __init__(self, attr_dim=3, semantic_dim=64, hidden_dims=[128, 256, 128]):
+
+    def __init__(self, attr_dim=5, semantic_dim=64, hidden_dims=[128, 64]):
         super().__init__()
+        self.attr_dim = attr_dim
+        self.semantic_dim = semantic_dim
 
         layers = []
-        # 输入层
+        # Input layer
         layers.append(nn.Linear(attr_dim, hidden_dims[0]))
         layers.append(nn.BatchNorm1d(hidden_dims[0]))
-        layers.append(nn.ReLU())
+        layers.append(nn.LeakyReLU(0.1)) # Using LeakyReLU as in other parts
+        layers.append(nn.Dropout(0.2)) # Optional dropout for regularization
 
-        # 隐藏层
+        # Hidden layers
         for i in range(len(hidden_dims) - 1):
             layers.append(nn.Linear(hidden_dims[i], hidden_dims[i + 1]))
             layers.append(nn.BatchNorm1d(hidden_dims[i + 1]))
-            layers.append(nn.ReLU())
+            layers.append(nn.LeakyReLU(0.1))
             layers.append(nn.Dropout(0.2))
 
-        # 输出层
+        # Output layer
         layers.append(nn.Linear(hidden_dims[-1], semantic_dim))
+        # No activation on the output layer to allow it to map to any part of the latent space
 
         self.mapper = nn.Sequential(*layers)
 
@@ -1036,20 +559,22 @@ class FaultSemanticBuilder:
         self.actual_latent_dim = latent_dim
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.autoencoder = None
-        self.preprocessor = DataPreprocessor(sample_length=SEGMENT_LENGTH)
-        self.knowledge_dim = 3
+        # DataPreprocessor will now return HF/LF ratios
+        self.preprocessor = DataPreprocessor(sample_length=SEGMENT_LENGTH, sampling_frequency=SAMPLING_FREQUENCY_HZ)
+        self.knowledge_dim = 3  # Base knowledge dim remains 3 for is_inner/outer/ball
+        self.enhanced_attribute_dim = 5  # New attribute dimension
         self.data_semantics = {}
         self.idx_to_fault = {}
         self.all_latent_features = None
         self.all_latent_labels = None
         self.compound_data_semantic_generation_rule = compound_data_semantic_generation_rule
+        self.attribute_mapper = None  # Will be initialized and trained
 
         self.fault_location_attributes = {
             'normal': [0, 0, 0], 'inner': [1, 0, 0], 'outer': [0, 1, 0], 'ball': [0, 0, 1],
             'inner_outer': [1, 1, 0], 'inner_ball': [1, 0, 1], 'outer_ball': [0, 1, 1],
             'inner_outer_ball': [1, 1, 1]
         }
-
 
         self.single_fault_types_ordered = ['normal', 'inner', 'outer', 'ball']
 
@@ -1060,22 +585,169 @@ class FaultSemanticBuilder:
             'inner_outer_ball': ['inner', 'outer', 'ball']
         }
 
-        self.enhanced_attribute_dim = 3
-
-    def _get_enhanced_attributes(self):
-
-        return {ft: np.array(attrs, dtype=np.float32)
-                for ft, attrs in self.fault_location_attributes.items()}
+    def _get_enhanced_attributes(self, fault_type, hf_ratio=0.0, lf_ratio=0.0):
+        """
+        Returns the 5-dim attribute vector for a given fault type,
+        incorporating HF/LF ratios.
+        """
+        base_attributes = self.fault_location_attributes.get(fault_type, [0, 0, 0])
+        return np.array(base_attributes + [hf_ratio, lf_ratio], dtype=np.float32)
 
     def build_knowledge_semantics(self):
         """构建基于轴承故障位置和尺寸的知识语义 (Unchanged from original)"""
+
         knowledge_semantics = {
             fault_type: np.array(location_encoding, dtype=np.float32)
             for fault_type, location_encoding in self.fault_location_attributes.items()
         }
         self.knowledge_dim = 3
-
         return knowledge_semantics
+
+    def train_attribute_mapper(self,
+                               single_fault_segments, single_fault_labels, single_fault_hf_lf_ratios,
+                               pseudo_compound_segments, pseudo_compound_labels, pseudo_compound_hf_lf_ratios,
+                               ae_model,
+                               epochs=200, batch_size=64, lr=0.001, lambda_compound=1.0):
+        """
+        Trains the AttributeSemanticMapper using single and pseudo-compound fault data.
+        """
+        print("\n--- Training AttributeSemanticMapper ---")
+        self.attribute_mapper = AttributeSemanticMapper(
+            attr_dim=self.enhanced_attribute_dim,
+            semantic_dim=ae_model.latent_dim
+        ).to(self.device)
+        optimizer = optim.AdamW(self.attribute_mapper.parameters(), lr=lr, weight_decay=1e-5)
+        mse_loss_fn = nn.MSELoss()
+
+        ae_model.eval()  # Ensure AE is in eval mode for feature extraction
+
+        # Prepare training data for the mapper
+        X_mapper_train_list = []  # 5-dim attribute vectors
+        Y_mapper_target_list = []  # Target AE latent vectors
+
+        # 1. Single Fault Samples for Mapper Training
+        unique_single_labels = np.unique(single_fault_labels)
+        single_fault_prototypes = {}  # Re-compute prototypes for mapper training target
+        with torch.no_grad():
+            for lbl_idx in unique_single_labels:
+                fault_name = self.idx_to_fault.get(lbl_idx)
+                if fault_name not in self.single_fault_types_ordered:  # Only train on explicit single faults
+                    continue
+                mask = (single_fault_labels == lbl_idx)
+                segments_for_proto = torch.FloatTensor(single_fault_segments[mask]).to(self.device)
+
+                if segments_for_proto.shape[0] == 0: continue
+
+                # Ensure input to AE encode is [B, L] or [B, 1, L]
+                ae_input = segments_for_proto.squeeze(1) if segments_for_proto.dim() == 3 and segments_for_proto.shape[
+                    1] == 1 else segments_for_proto
+                if ae_input.dim() != 2 or ae_input.shape[1] != ae_model.input_length:
+                    print(
+                        f"W: Mapper train - AE input shape mismatch. Expected [B, {ae_model.input_length}], got {ae_input.shape}. Skipping proto calculation.")
+                    continue
+
+                proto_features = ae_model.encode(ae_input)
+                single_fault_prototypes[fault_name] = proto_features.mean(dim=0).cpu().numpy()
+
+        for i, segment in enumerate(single_fault_segments):
+            lbl_idx = single_fault_labels[i]
+            fault_name = self.idx_to_fault.get(lbl_idx)
+            if fault_name in single_fault_prototypes:
+                # Get the 5-dim attribute vector for this single segment
+                hf_lf = single_fault_hf_lf_ratios[i]
+                attribute_vec = self._get_enhanced_attributes(fault_name, hf_lf[0], hf_lf[1])
+                X_mapper_train_list.append(attribute_vec)
+                Y_mapper_target_list.append(single_fault_prototypes[fault_name])  # Target is the class prototype
+
+        # 2. Pseudo-Compound Fault Samples for Mapper Training
+        if pseudo_compound_segments.shape[0] > 0:
+            with torch.no_grad():
+                pseudo_compound_segments_tensor = torch.FloatTensor(pseudo_compound_segments).to(self.device)
+
+                ae_input_pseudo = pseudo_compound_segments_tensor.squeeze(
+                    1) if pseudo_compound_segments_tensor.dim() == 3 and pseudo_compound_segments_tensor.shape[
+                    1] == 1 else pseudo_compound_segments_tensor
+                if ae_input_pseudo.dim() != 2 or ae_input_pseudo.shape[1] != ae_model.input_length:
+                    print(
+                        f"W: Mapper train - Pseudo AE input shape mismatch. Expected [B, {ae_model.input_length}], got {ae_input_pseudo.shape}. Skipping pseudo data.")
+                else:
+                    pseudo_compound_latent_features = ae_model.encode(ae_input_pseudo).cpu().numpy()
+
+            for i, segment in enumerate(pseudo_compound_segments):
+                lbl_idx = pseudo_compound_labels[i]
+                fault_name = self.idx_to_fault.get(lbl_idx)
+                hf_lf = pseudo_compound_hf_lf_ratios[i]
+                attribute_vec = self._get_enhanced_attributes(fault_name, hf_lf[0], hf_lf[1])
+                X_mapper_train_list.append(attribute_vec)
+                Y_mapper_target_list.append(pseudo_compound_latent_features[i])  # Target is its own AE latent feature
+
+        if not X_mapper_train_list:
+            print("Warning: No valid data for attribute mapper training. Skipping.")
+            return
+
+        X_mapper_train = torch.FloatTensor(np.array(X_mapper_train_list)).to(self.device)
+        Y_mapper_target = torch.FloatTensor(np.array(Y_mapper_target_list)).to(self.device)
+
+        # Ensure target semantic dim matches AE_LATENT_DIM
+        if Y_mapper_target.shape[1] != ae_model.latent_dim:
+            print(
+                f"Error: Mapper target semantic dimension mismatch. Expected {ae_model.latent_dim}, got {Y_mapper_target.shape[1]}.")
+            return
+
+        mapper_dataset = TensorDataset(X_mapper_train, Y_mapper_target)
+        mapper_loader = DataLoader(mapper_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+        if len(mapper_loader) == 0:
+            print("Warning: Mapper loader has 0 batches. Skipping training.")
+            return
+
+        best_mapper_loss = float('inf')
+        patience_counter = 0
+        mapper_patience = 30
+
+        for epoch in range(epochs):
+            self.attribute_mapper.train()
+            epoch_loss = 0
+            num_batches_mapper = 0
+            for x_attr_batch, y_target_latent_batch in mapper_loader:
+                optimizer.zero_grad()
+                pred_latent = self.attribute_mapper(x_attr_batch)
+
+                loss_single = mse_loss_fn(pred_latent,
+                                          y_target_latent_batch)  # Simplified L_single + L_compound into one MSE here
+
+                if torch.isnan(loss_single) or torch.isinf(loss_single):
+                    print(f"W: Mapper loss is NaN/Inf in epoch {epoch + 1}. Skipping batch.")
+                    continue
+
+                loss_single.backward()
+                torch.nn.utils.clip_grad_norm_(self.attribute_mapper.parameters(), max_norm=1.0)
+                optimizer.step()
+                epoch_loss += loss_single.item()
+                num_batches_mapper += 1
+
+            if num_batches_mapper == 0:
+                print(f"Warning: Attribute mapper epoch {epoch + 1} had no valid batches.")
+                continue
+
+            avg_epoch_loss = epoch_loss / num_batches_mapper
+            if (epoch + 1) % 20 == 0:
+                print(f"  AttributeMapper Epoch {epoch + 1}/{epochs}, Loss: {avg_epoch_loss:.6f}")
+
+            if avg_epoch_loss < best_mapper_loss:
+                best_mapper_loss = avg_epoch_loss
+                patience_counter = 0
+                torch.save(self.attribute_mapper.state_dict(), "attribute_mapper_best.pth")
+            else:
+                patience_counter += 1
+                if patience_counter >= mapper_patience:
+                    print(f"  AttributeMapper early stopping at epoch {epoch + 1}.")
+                    break
+
+        if os.path.exists("attribute_mapper_best.pth"):
+            self.attribute_mapper.load_state_dict(torch.load("attribute_mapper_best.pth", map_location=self.device))
+        print("AttributeSemanticMapper training complete, best model loaded.")
+        self.attribute_mapper.eval()
+
 
     def _ae_contrastive_loss(self, latent, latent_aug, labels, temperature=0.2):
         """计算对比损失 (logic matching gen.py _contrastive_loss)."""
@@ -1086,7 +758,6 @@ class FaultSemanticBuilder:
         latent_aug_norm = nn.functional.normalize(latent_aug, p=2, dim=1)
 
         if torch.isnan(latent_norm).any() or torch.isnan(latent_aug_norm).any():
-
             latent_norm = torch.nan_to_num(latent_norm, nan=0.0)
             latent_aug_norm = torch.nan_to_num(latent_aug_norm, nan=0.0)
 
@@ -1114,83 +785,107 @@ class FaultSemanticBuilder:
             mean_loss = contrastive_loss_terms.mean()
 
         if torch.isnan(mean_loss) or torch.isinf(mean_loss):
-
-
             return torch.tensor(0.0, device=latent.device)
 
         return mean_loss
 
-    def train_autoencoder(self, X_train, labels, epochs=AE_EPOCHS, batch_size=AE_BATCH_SIZE,
-                          lr=AE_LR, contrastive_weight=AE_CONTRASTIVE_WEIGHT):
-        """使用修复版增强自编码器"""
-        print("Training Fixed Enhanced Autoencoder with 32-dim latent space...")
+    def train_autoencoder(self,
+                          X_train,  # numpy array (N, L)
+                          labels,  # numpy array (N,)
+                          epochs=AE_EPOCHS,
+                          batch_size=AE_BATCH_SIZE,
+                          lr=AE_LR,
+                          contrastive_weight=AE_CONTRASTIVE_WEIGHT):
 
-        # 导入修复版本
+        # 1) 数据转张量
+        device = self.device
+        X_tensor = torch.FloatTensor(X_train).to(device)  # [N, L]
+        y_tensor = torch.LongTensor(labels).to(device)  # [N]
 
+        # 2) 构建 AE 模型与 Trainer
+        ae_model = ContrastiveAutoencoder(
+            input_length=X_train.shape[1],
+            latent_dim=self.latent_dim_config
+        ).to(device)
+        trainer = AETrainer(ae_model, device=device)
 
-        # 确保输入数据维度正确
-        if X_train.ndim == 2:
-            input_length = X_train.shape[1]
-        else:
-            raise ValueError(f"Expected 2D input, got {X_train.ndim}D")
-
-        # 创建增强自编码器
-        self.autoencoder = EnhancedAutoencoder(
-            input_length=input_length,
-            latent_dim=32,
-            num_classes=len(np.unique(labels))
-        )
-
-        # 使用修复版训练器
-        trainer = EnhancedAETrainer(self.autoencoder, device=self.device)
-
-        # 转换数据
-        X_tensor = torch.FloatTensor(X_train).to(self.device)
-        y_tensor = torch.LongTensor(labels).to(self.device)
-
-        # 训练
-        self.autoencoder = trainer.train(
-            X=X_tensor, y=y_tensor,
-            epochs=epochs, batch_size=batch_size, lr=lr,
+        # 3) 训练
+        trainer.train(
+            X=X_tensor,
+            y=y_tensor,
+            epochs=epochs,
+            batch_size=batch_size,
+            lr=lr,
             contrastive_weight=contrastive_weight
         )
 
-        self.actual_latent_dim = 32
-        print(f"Fixed Enhanced AE training complete. Latent dim: {self.actual_latent_dim}")
+        # 4) 保存训练结果
+        self.autoencoder = trainer.model
+        self.actual_latent_dim = self.autoencoder.latent_dim
+        print(f"  AE latent dim set to {self.actual_latent_dim}")
 
-        # 提取训练样本的潜在特征并计算数据语义
-        self._extract_training_latent_features(X_tensor, y_tensor)
-
-        return self.autoencoder
-    def _extract_training_latent_features(self, X_tensor, y_tensor):
-        """提取训练数据的潜在特征"""
+        # 5) 提取所有训练样本的潜特征
         self.autoencoder.eval()
         all_latent = []
-
         with torch.no_grad():
-            batch_size = 128
-            for i in range(0, X_tensor.shape[0], batch_size):
-                batch = X_tensor[i:i + batch_size]
-                latent = self.autoencoder.encode(batch)
-                all_latent.append(latent.cpu().numpy())
+            step = batch_size * 2  # Can be larger for inference
+            for i in range(0, X_tensor.size(0), step):
+                batch = X_tensor[i:i + step]
+                if batch.size(0) == 0:
+                    continue
+                # Ensure input to AE encode is [B, L] or [B, 1, L]
+                if batch.dim() == 3 and batch.shape[1] == 1:  # if [B,1,L]
+                    pass  # already correct
+                elif batch.dim() == 2:  # if [B,L]
+                    pass  # AE encode handles unsqueezing
+                else:  # Reshape if needed, e.g. from other formats
+                    batch = batch.view(batch.size(0), -1)  # Flatten to [B,L]
+                    if batch.shape[1] != self.autoencoder.input_length:
+                        print(
+                            f"Warning: AE batch input length mismatch after flatten. Expected {self.autoencoder.input_length}, got {batch.shape[1]}. Skipping batch.")
+                        continue
 
-        self.all_latent_features = np.vstack(all_latent)
-        self.all_latent_labels = y_tensor.cpu().numpy()[:len(self.all_latent_features)]
+                z = self.autoencoder.encode(batch)  # [b, latent_dim]
+                all_latent.append(z.cpu().numpy())
 
-        # 计算数据语义原型
+        if not all_latent:
+            print("Warning: No latent features extracted from AE.")
+            self.all_latent_features = np.empty((0, self.actual_latent_dim))
+            self.all_latent_labels = np.empty((0,))
+            self.data_semantics = {}
+            return
+
+        all_latent = np.vstack(all_latent)
+        self.all_latent_features = all_latent
+        # Ensure labels correspond to the successfully processed latent features
+        self.all_latent_labels = labels[:all_latent.shape[0]]
+
+        # 6) 计算每个故障类型的语义中心 (centroids)
         self.data_semantics = {}
         unique_labels = np.unique(self.all_latent_labels)
-
         for lbl in unique_labels:
             mask = (self.all_latent_labels == lbl)
-            feats = self.all_latent_features[mask]
-            if feats.shape[0] > 0:
-                # 使用类中心作为原型
-                centroid = np.mean(feats, axis=0)
-                fault_name = self.idx_to_fault.get(int(lbl), f"label_{lbl}")
-                self.data_semantics[fault_name] = centroid.astype(np.float32)
+            feats = self.all_latent_features[mask]  # Use self.all_latent_features
+            if feats.shape[0] == 0:
+                continue
+            # 最多两个簇保留主要分布
+            n_clusters = min(2, feats.shape[0])
+            if feats.shape[0] > 1:  # KMeans needs at least 2 samples for n_clusters=2
+                try:
+                    km = KMeans(n_clusters=n_clusters, random_state=42, n_init='auto').fit(feats)
+                    counts = np.bincount(km.labels_)
+                    main_cluster_label = np.argmax(counts)
+                    centroid = km.cluster_centers_[main_cluster_label]
+                except Exception as e:
+                    print(f"Warning: KMeans clustering failed for label {lbl}: {e}. Using mean as centroid.")
+                    centroid = np.mean(feats, axis=0)
+            else:  # Only one sample for this label
+                centroid = feats[0]
 
-        print(f"Extracted data semantics for {len(self.data_semantics)} fault types")
+            fault_name = self.idx_to_fault.get(int(lbl), f"label_{lbl}")
+            self.data_semantics[fault_name] = centroid.astype(np.float32)
+
+        print(f"AE training complete. Computed {len(self.data_semantics)} class centroids.")
 
     def extract_data_semantics(self, X, fault_labels=None):
         """Extract data semantics using the trained AE (spectral clustering part retained)."""
@@ -1214,17 +909,27 @@ class FaultSemanticBuilder:
 
                 batch_valid_mask = torch.all(torch.isfinite(batch_x), dim=1)
                 if not batch_valid_mask.all():
-
                     batch_x = batch_x[batch_valid_mask]
                     batch_indices = batch_indices[batch_valid_mask.cpu().numpy()]
 
                 if batch_x.shape[0] == 0: continue
 
+                # Ensure input to AE encode is [B, L] or [B, 1, L]
+                if batch_x.dim() == 3 and batch_x.shape[1] == 1:  # if [B,1,L]
+                    pass
+                elif batch_x.dim() == 2:  # if [B,L]
+                    pass
+                else:
+                    batch_x = batch_x.view(batch_x.size(0), -1)
+                    if batch_x.shape[1] != self.autoencoder.input_length:
+                        print(
+                            f"Warning: AE batch input length mismatch in extract_data_semantics. Expected {self.autoencoder.input_length}, got {batch_x.shape[1]}. Skipping batch.")
+                        continue
+
                 z_batch = self.autoencoder.encode(batch_x)
 
                 batch_z_valid_mask = torch.all(torch.isfinite(z_batch), dim=1)
                 if not batch_z_valid_mask.all():
-
                     z_batch = z_batch[batch_z_valid_mask]
                     batch_indices = batch_indices[batch_z_valid_mask.cpu().numpy()]
 
@@ -1233,7 +938,6 @@ class FaultSemanticBuilder:
                     filtered_indices.extend(batch_indices)
 
         if not all_data_semantics_list:
-
             return np.empty((0, self.actual_latent_dim)), {} if fault_labels is not None else np.empty(
                 (0, self.actual_latent_dim))
 
@@ -1249,31 +953,40 @@ class FaultSemanticBuilder:
                 indices = np.where(fault_labels_filtered == fault)[0]
                 if len(indices) > 0:
                     fault_type_semantics = data_semantics[indices]
-                    if len(fault_type_semantics) > 10:
+                    if len(fault_type_semantics) > 10:  # spectral clustering needs enough samples
                         n_clusters = max(2, min(5, len(fault_type_semantics) // 3))
-                        try:
-                            spectral = SpectralClustering(n_clusters=n_clusters, affinity='nearest_neighbors',
-                                                          assign_labels='kmeans', random_state=42,
-                                                          n_neighbors=max(5, min(10, len(fault_type_semantics) - 1)))
-                            cluster_labels = spectral.fit_predict(fault_type_semantics)
-
-                            if cluster_labels is None or len(cluster_labels) != len(fault_type_semantics):
-                                prototype = np.mean(fault_type_semantics, axis=0)
-                            else:
-                                counts = np.bincount(cluster_labels[cluster_labels >= 0])
-                                if len(counts) > 0:
-                                    largest_cluster = np.argmax(counts)
-                                    prototype_idx = np.where(cluster_labels == largest_cluster)[0]
-                                    if len(prototype_idx) > 0:
-                                        prototype = np.mean(fault_type_semantics[prototype_idx], axis=0)
-                                    else:
-                                        prototype = np.mean(fault_type_semantics, axis=0)  # Fallback
-                                else:
-                                    prototype = np.mean(fault_type_semantics, axis=0)  # Fallback
-                        except Exception as e:
-
+                        # Ensure n_neighbors is less than n_samples
+                        n_neighbors_spectral = max(5, min(10, len(fault_type_semantics) - 1))
+                        if n_neighbors_spectral < 2:  # SpectralClustering needs at least 2 neighbors
                             prototype = np.mean(fault_type_semantics, axis=0)
-                    else:
+                        else:
+                            try:
+                                spectral = SpectralClustering(n_clusters=n_clusters, affinity='nearest_neighbors',
+                                                              assign_labels='kmeans', random_state=42,
+                                                              n_neighbors=n_neighbors_spectral)
+                                cluster_labels = spectral.fit_predict(fault_type_semantics)
+
+                                if cluster_labels is None or len(cluster_labels) != len(fault_type_semantics):
+                                    prototype = np.mean(fault_type_semantics, axis=0)
+                                else:
+                                    valid_cluster_labels = cluster_labels[cluster_labels >= 0]
+                                    if len(valid_cluster_labels) == 0:  # All samples might be outliers
+                                        prototype = np.mean(fault_type_semantics, axis=0)
+                                    else:
+                                        counts = np.bincount(valid_cluster_labels)
+                                        if len(counts) > 0:
+                                            largest_cluster = np.argmax(counts)
+                                            prototype_idx = np.where(cluster_labels == largest_cluster)[0]
+                                            if len(prototype_idx) > 0:
+                                                prototype = np.mean(fault_type_semantics[prototype_idx], axis=0)
+                                            else:
+                                                prototype = np.mean(fault_type_semantics, axis=0)  # Fallback
+                                        else:
+                                            prototype = np.mean(fault_type_semantics, axis=0)  # Fallback
+                            except Exception as e:
+                                print(f"W: Spectral clustering failed for fault {fault}: {e}. Using mean.")
+                                prototype = np.mean(fault_type_semantics, axis=0)
+                    else:  # Not enough samples for spectral clustering
                         prototype = np.mean(fault_type_semantics, axis=0)
 
                     if np.all(np.isfinite(prototype)):
@@ -1285,104 +998,82 @@ class FaultSemanticBuilder:
         else:
             return data_semantics
 
+        # In class FaultSemanticBuilder:
 
+    def synthesize_compound_semantics(self, single_fault_prototypes, pseudo_compound_hf_lf_ratios_avg={}):
+        """
+        Synthesize compound semantics using the trained AttributeSemanticMapper.
+        pseudo_compound_hf_lf_ratios_avg: dictionary with averaged HF/LF for each pseudo compound type.
+        """
+        print("\n--- Synthesizing Compound Semantics using AttributeSemanticMapper ---")
+        if self.attribute_mapper is None or not os.path.exists("attribute_mapper_best.pth"):
+            print(
+                "Error: AttributeSemanticMapper not trained or model file not found. Cannot synthesize compound semantics.")
+            return self._synthesize_by_rule(single_fault_prototypes, 'average_prototypes')  # Fallback
 
-    def synthesize_compound_semantics(self, single_fault_prototypes):
-        """
-        Synthesizes compound fault semantics using a "Delta Summation" approach
-        based on deviations from the 'normal' state.
-        This method replaces previous rule-based synthesis logic.
-        """
+        self.attribute_mapper.eval()
         synthesized_compound_semantics = {}
-        print("Synthesizing compound fault semantics using 'Delta Summation' method...")
 
-        # Prerequisite: 'normal' state prototype must exist and be valid
-        if 'normal' not in single_fault_prototypes or \
-                not np.all(np.isfinite(single_fault_prototypes['normal'])):
-            print("W: 'normal' state prototype is missing or invalid. "
-                  "Falling back to 'average_prototypes' for all compound faults.")
-            # Use the existing _synthesize_by_rule for a complete fallback if 'normal' is unavailable
-            return self._synthesize_by_rule(single_fault_prototypes,
-                                            'average_prototypes',
-                                            specific_types=list(self.compound_fault_definitions.keys()))
+        # Default HF/LF if not provided for a compound type (e.g., from average of constituents)
+        default_hf_lf = {}
+        for cf_name, constituents in self.compound_fault_definitions.items():
+            avg_hf = []
+            avg_lf = []
+            for constituent_name in constituents:
+                # Find a way to get HF/LF for single prototypes if needed for fallback average
+                # For now, let's assume `pseudo_compound_hf_lf_ratios_avg` provides typical values
+                pass
+            if cf_name not in pseudo_compound_hf_lf_ratios_avg:
+                # Simple fallback: average HF/LF of constituent single faults if available
+                const_hfs = [single_fault_prototypes[c].get('hf_ratio', 0.5) for c in constituents if
+                             c in single_fault_prototypes and hasattr(single_fault_prototypes[c],
+                                                                      'hf_ratio')]  # Assuming prototypes might store this
+                const_lfs = [single_fault_prototypes[c].get('lf_ratio', 0.5) for c in constituents if
+                             c in single_fault_prototypes and hasattr(single_fault_prototypes[c], 'lf_ratio')]
+                default_hf_lf[cf_name] = [np.mean(const_hfs) if const_hfs else 0.5,
+                                          np.mean(const_lfs) if const_lfs else 0.5]
 
-        sem_normal = single_fault_prototypes['normal']
-        deltas = {}  # To store (semantic_fault - semantic_normal)
-
-        # Calculate deltas for all available single fault types relative to normal
-        # self.single_fault_types_ordered likely includes 'normal', 'inner', 'outer', 'ball'
-        for sf_name in self.single_fault_types_ordered:
-            if sf_name == 'normal':  # Delta for normal itself is not needed for this logic
+        for cf_name, constituents in self.compound_fault_definitions.items():
+            # Get base 3-dim attribute (location encoding)
+            base_attr = self.fault_location_attributes.get(cf_name)
+            if base_attr is None:
+                print(f"Warning: Base attributes for compound fault '{cf_name}' not found.")
                 continue
 
-            if sf_name in single_fault_prototypes and \
-                    np.all(np.isfinite(single_fault_prototypes[sf_name])):
-                deltas[sf_name] = single_fault_prototypes[sf_name] - sem_normal
+            # Get HF/LF ratios for this compound type
+            # Prioritize values from pseudo_compound_hf_lf_ratios_avg if available
+            hf_ratio, lf_ratio = pseudo_compound_hf_lf_ratios_avg.get(cf_name, default_hf_lf.get(cf_name, [0.5,
+                                                                                                           0.5]))  # Default to 0.5 if no info
+
+            # Construct the 5-dim attribute vector
+            attr_vec_5d = np.array(base_attr + [hf_ratio, lf_ratio], dtype=np.float32)
+
+            if not np.all(np.isfinite(attr_vec_5d)):
+                print(f"Warning: Attribute vector for '{cf_name}' is non-finite during synthesis.")
+                continue
+
+            attr_tensor = torch.FloatTensor(attr_vec_5d).unsqueeze(0).to(self.device)
+            with torch.no_grad():
+                generated_semantic = self.attribute_mapper(attr_tensor).cpu().numpy().squeeze(0)
+
+            if np.all(np.isfinite(generated_semantic)):
+                # Apply post-processing if needed (from original _post_process_compound_semantic)
+                generated_semantic = self._post_process_compound_semantic(
+                    generated_semantic, cf_name, single_fault_prototypes
+                )
+                synthesized_compound_semantics[cf_name] = generated_semantic
             else:
-                print(f"W: Prototype for single fault '{sf_name}' is missing or invalid. "
-                      f"Cannot compute its delta, so it cannot be a component in Delta Summation.")
+                print(f"Warning: Mapper generated non-finite semantic for '{cf_name}'.")
 
-        # Synthesize semantics for compound faults using the calculated deltas
-        for cf_name, constituent_names in self.compound_fault_definitions.items():
-            current_sum_of_deltas = np.zeros_like(sem_normal)
-            valid_constituent_deltas_count = 0
-            all_constituent_deltas_available = True
-
-            for constituent_name in constituent_names:
-                if constituent_name in deltas:  # Check if delta was successfully computed
-                    current_sum_of_deltas += deltas[constituent_name]
-                    valid_constituent_deltas_count += 1
-                else:
-                    all_constituent_deltas_available = False
-                    print(
-                        f"W: Delta for constituent '{constituent_name}' of compound fault '{cf_name}' is unavailable. "
-                        f"Cannot synthesize '{cf_name}' using Delta Summation.")
-                    break  # Stop processing this compound fault if any constituent delta is missing
-
-            if all_constituent_deltas_available:
-                # All constituents had valid deltas, proceed with synthesis
-                synthesized_semantic_vec = sem_normal + current_sum_of_deltas
-
-                if np.all(np.isfinite(synthesized_semantic_vec)):
-                    # Apply post-processing (from original code)
-                    processed_semantic_vec = self._post_process_compound_semantic(
-                        synthesized_semantic_vec, cf_name, single_fault_prototypes
-                    )
-                    if np.all(np.isfinite(processed_semantic_vec)):
-                        synthesized_compound_semantics[cf_name] = processed_semantic_vec
-                        # print(f"  Successfully synthesized and processed semantic for '{cf_name}'.")
-                    else:
-                        print(f"W: Post-processing resulted in non-finite semantic for '{cf_name}'. "
-                              f"This fault type might be handled by fallback.")
-                else:
-                    print(f"W: Initial 'Delta Summation' resulted in non-finite semantic for '{cf_name}'. "
-                          f"This fault type might be handled by fallback.")
-            # If not all_constituent_deltas_available, this cf_name is skipped here and will be caught by the fallback.
-
-        # Fallback for any compound faults that were not successfully synthesized by Delta Summation
-        num_synthesized = len(synthesized_compound_semantics)
-        num_expected = len(self.compound_fault_definitions)
-
-        if num_synthesized < num_expected:
-            missing_types = [cf_key for cf_key in self.compound_fault_definitions.keys()
-                             if cf_key not in synthesized_compound_semantics]
-            if missing_types:
-                print(f"I: Applying fallback ('average_prototypes') for {len(missing_types)} "
-                      f"compound types not generated by Delta Summation: {missing_types}")
-
-                # Use _synthesize_by_rule for the missing types only
-                fallback_semantics = self._synthesize_by_rule(single_fault_prototypes,
-                                                              'average_prototypes',
-                                                              specific_types=missing_types)
-                synthesized_compound_semantics.update(fallback_semantics)
-
-        final_generated_count = len(synthesized_compound_semantics)
-        print(f"Compound semantic synthesis complete. "
-              f"Generated {final_generated_count}/{num_expected} types.")
-        if final_generated_count < num_expected:
-            still_missing = [cf_key for cf_key in self.compound_fault_definitions.keys()
-                             if cf_key not in synthesized_compound_semantics]
-            print(f"W: Could not generate semantics for: {still_missing} even after fallback.")
+        # Fallback for any compound type that failed to synthesize
+        missing_types = [cf for cf in self.compound_fault_definitions.keys() if
+                         cf not in synthesized_compound_semantics]
+        if missing_types:
+            print(
+                f"Warning: Missing compound semantics for {missing_types}. Applying fallback (average of prototypes).")
+            last_resort_semantics = self._synthesize_by_rule(single_fault_prototypes, 'average_prototypes',
+                                                             specific_types=missing_types)
+            synthesized_compound_semantics.update(last_resort_semantics)
 
         return synthesized_compound_semantics
 
@@ -1393,6 +1084,9 @@ class FaultSemanticBuilder:
 
         for cf_name in target_compound_types:
             constituents = self.compound_fault_definitions.get(cf_name)
+            if constituents is None:
+                print(f"Warning: No definition for compound fault '{cf_name}' in _synthesize_by_rule.")
+                continue
 
             component_semantic_list = []
             valid_components = True
@@ -1402,7 +1096,12 @@ class FaultSemanticBuilder:
                     component_semantic_list.append(single_fault_prototypes[constituent_name])
                 else:
                     valid_components = False
+                    print(
+                        f"Warning: Constituent '{constituent_name}' for '{cf_name}' is missing or invalid in single_fault_prototypes.")
                     break
+
+            if not component_semantic_list:  # Handles cases where constituents might be empty or all invalid
+                valid_components = False
 
             if valid_components and component_semantic_list:
                 generated_semantic = None
@@ -1439,39 +1138,51 @@ class FaultSemanticBuilder:
             return refined
 
         # 1. 确保复合故障语义与组件故障语义保持合理的相似度关系
-        component_vecs = [single_prototypes[comp] for comp in components]
+        component_vecs = [single_prototypes[comp] for comp in components if
+                          np.all(np.isfinite(single_prototypes[comp]))]
+        if not component_vecs: return refined  # No valid component vectors
+
         avg_component_vec = np.mean(component_vecs, axis=0)
+        if not np.all(np.isfinite(avg_component_vec)): return refined  # Avg component vec is not finite
 
         # 计算当前相似度
-        current_sim = np.dot(refined, avg_component_vec) / (
-                np.linalg.norm(refined) * np.linalg.norm(avg_component_vec) + 1e-8)
+        norm_refined = np.linalg.norm(refined)
+        norm_avg_comp = np.linalg.norm(avg_component_vec)
+
+        if norm_refined < 1e-8 or norm_avg_comp < 1e-8:
+            current_sim = 0.0
+        else:
+            current_sim = np.dot(refined, avg_component_vec) / (norm_refined * norm_avg_comp)
 
         # 如果相似度过低，向平均组件向量方向调整
         if current_sim < 0.3:
             adjustment_factor = 0.3
             refined = (1 - adjustment_factor) * refined + adjustment_factor * avg_component_vec
 
-        # 2. 根据复合故障类型进行特定调整
         if compound_type == 'inner_outer':
-            # 增强特定维度以区分inner_outer
+
             mid = len(refined) // 2
-            refined[mid:] = refined[mid:] * 1.05
+            refined[mid:] = refined[mid:] * 1.05  # Small boost
 
         elif compound_type == 'inner_ball' or compound_type == 'outer_ball':
-            # 添加特定调制模式
-            mod_pattern = np.sin(np.linspace(0, 3 * np.pi, len(refined))) * 0.05
-            refined = refined + mod_pattern * np.mean(np.abs(refined))
+
+            if len(refined) > 0:  # Ensure refined is not empty
+                mod_pattern = np.sin(np.linspace(0, 3 * np.pi, len(refined))) * 0.05  # Small amplitude
+                refined = refined + mod_pattern * np.mean(np.abs(refined))  # Scale modulation by mean abs value
 
         elif compound_type == 'inner_outer_ball':
-            # 加强信号幅度以反映多重故障的严重性
+
             refined = refined * 1.1
 
-        # 3. 归一化处理后的向量
-        norm = np.linalg.norm(refined)
-        if norm > 1e-8:
-            refined = refined / norm * np.linalg.norm(semantic_vec)  # 保持原始范数
+        final_norm = np.linalg.norm(refined)
+        original_norm = np.linalg.norm(semantic_vec)
 
-        return refined
+        if final_norm > 1e-8 and original_norm > 1e-8:
+            refined = refined / final_norm * original_norm
+        elif final_norm > 1e-8:
+            refined = refined / final_norm
+
+        return refined if np.all(np.isfinite(refined)) else semantic_vec
 
     def _generate_fallback_semantics(self, fault_types, single_prototypes):
         compound_semantics = {}
@@ -1485,6 +1196,10 @@ class FaultSemanticBuilder:
                 if comp in single_prototypes and np.all(np.isfinite(single_prototypes[comp])):
                     component_semantics.append(single_prototypes[comp])
 
+            if not component_semantics:  # If no valid components found
+                print(f"Warning: No valid components to generate fallback for {compound_type}")
+                continue
+
             if component_semantics:
                 # 使用平均组合
                 combined = np.mean(component_semantics, axis=0)
@@ -1496,21 +1211,17 @@ class FaultSemanticBuilder:
 
                 if np.all(np.isfinite(combined)):
                     compound_semantics[compound_type] = combined
-                    print(f"  - 已补充生成 {compound_type} 的语义表示")
+                    print(f"  - 已补充生成 {compound_type} 的语义表示 (fallback)")
+                else:
+                    print(f"Warning: Fallback generation for {compound_type} resulted in non-finite semantic.")
 
         return compound_semantics
 
     def _fallback_compound_synthesis(self, single_fault_prototypes):
-        # 使用原有的Dempster-Shafer理论方法
+        print("Note: _fallback_compound_synthesis called, using average of components.")
         compound_semantics = {}
-        compound_combinations = {
-            'inner_outer': ['inner', 'outer'],
-            'inner_ball': ['inner', 'ball'],
-            'outer_ball': ['outer', 'ball'],
-            'inner_outer_ball': ['inner', 'outer', 'ball']
-        }
+        compound_combinations = self.compound_fault_definitions  # Use the class definition
 
-        # 使用原始方法中的融合逻辑
         for compound_type, components in compound_combinations.items():
             component_semantics = []
             all_valid = True
@@ -1523,6 +1234,9 @@ class FaultSemanticBuilder:
                     all_valid = False
                     break
 
+            if not component_semantics:
+                all_valid = False
+
             if all_valid and component_semantics:
                 # 简单平均作为回退策略
                 synthesized = np.mean(component_semantics, axis=0)
@@ -1534,170 +1248,11 @@ class FaultSemanticBuilder:
 
                 if np.all(np.isfinite(synthesized)):
                     compound_semantics[compound_type] = synthesized
+                else:
+                    print(
+                        f"Warning: Fallback synthesis for {compound_type} (in _fallback_compound_synthesis) resulted in non-finite semantic.")
 
         return compound_semantics
-
-class BidirectionalSemanticNetwork(nn.Module):
-    """进一步增强的双向语义映射网络，加入投影校准和多级特征对齐"""
-
-    def __init__(self, semantic_dim, feature_dim, hidden_dim1=512,
-                 hidden_dim2=256, dropout_rate=0.3):
-        super().__init__()
-        self.semantic_dim = semantic_dim
-        self.feature_dim = feature_dim
-        self.hidden_dim1 = hidden_dim1
-        self.hidden_dim2 = hidden_dim2
-        self.dropout_rate = dropout_rate
-        self.n_centers = 3
-        # 正向映射：语义→特征（深度+残差连接）
-        self.forward_net = nn.Sequential(
-            nn.Linear(semantic_dim, hidden_dim1),
-            nn.LayerNorm(hidden_dim1),
-            nn.LeakyReLU(0.2),
-            nn.Dropout(dropout_rate),
-
-            nn.Linear(hidden_dim1, hidden_dim2),
-            nn.LayerNorm(hidden_dim2),
-            nn.LeakyReLU(0.2),
-            nn.Dropout(dropout_rate * 0.8),
-
-            # 残差连接块1
-            ResidualMappingBlock(hidden_dim2),
-
-            # 残差连接块2
-            ResidualMappingBlock(hidden_dim2),
-
-            nn.Linear(hidden_dim2, feature_dim),
-            nn.LayerNorm(feature_dim),
-        )
-
-        # 反向映射：特征→语义
-        self.reverse_net = nn.Sequential(
-            nn.Linear(feature_dim, hidden_dim2),
-            nn.LayerNorm(hidden_dim2),
-            nn.LeakyReLU(0.2),
-            nn.Dropout(dropout_rate),
-
-            # 残差连接
-            ResidualMappingBlock(hidden_dim2),
-
-            nn.Linear(hidden_dim2, hidden_dim1),
-            nn.LayerNorm(hidden_dim1),
-            nn.LeakyReLU(0.2),
-            nn.Dropout(dropout_rate * 0.6),
-
-            nn.Linear(hidden_dim1, semantic_dim),
-        )
-
-        # 特征融合模块 - 用于处理复合故障的特殊性
-        self.feature_fusion = FeatureFusionModule(feature_dim)
-
-        # 初始化权重
-        self._init_weights()
-        self.n_centers = 3  # 子中心数
-        self.fc_out_multicenter = nn.Linear(self.hidden_dim2, self.feature_dim * self.n_centers)
-        self.fc_weight = nn.Linear(self.hidden_dim2, self.n_centers)
-        self.norm_out = nn.LayerNorm(self.feature_dim)
-
-    def _init_weights(self):
-        """改进的权重初始化"""
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='leaky_relu')
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-
-    def forward(self, x, mode='forward', fault_type=None):
-        if mode == 'forward':
-            hidden = self.forward_net(x)  # [batch, hidden_dim]
-            features_all = self.fc_out_multicenter(hidden).view(-1, self.n_centers, self.feature_dim)
-            weights = torch.softmax(self.fc_weight(hidden), dim=-1)
-            features = torch.sum(features_all * weights.unsqueeze(-1), dim=1)
-            features = self.norm_out(features)
-            return features
-
-        elif mode == 'reverse':
-            return self.reverse_net(x)
-
-        elif mode == 'cycle':
-            hidden = self.forward_net(x)
-            features_all = self.fc_out_multicenter(hidden).view(-1, self.n_centers, self.feature_dim)
-            weights = torch.softmax(self.fc_weight(hidden), dim=-1)
-            features = torch.sum(features_all * weights.unsqueeze(-1), dim=1)
-            features = self.norm_out(features)
-            reconstructed = self.reverse_net(features)
-            return features, reconstructed
-
-        else:
-            raise ValueError(f"未知的映射模式: {mode}")
-
-
-class ResidualMappingBlock(nn.Module):
-    """残差映射块，增强梯度流和特征提取"""
-
-    def __init__(self, dim):
-        super().__init__()
-        self.block = nn.Sequential(
-            nn.Linear(dim, dim),
-            nn.LayerNorm(dim),
-            nn.LeakyReLU(0.2),
-            nn.Dropout(0.2),
-            nn.Linear(dim, dim),
-            nn.LayerNorm(dim),
-        )
-        self.activation = nn.LeakyReLU(0.2)
-
-    def forward(self, x):
-        return self.activation(x + self.block(x))
-
-
-class FeatureFusionModule(nn.Module):
-    """特征融合模块 - 专门处理复合故障"""
-
-    def __init__(self, feature_dim):
-        super().__init__()
-        self.feature_dim = feature_dim
-
-        # 复合故障特殊处理层
-        self.compound_layers = nn.ModuleDict({
-            'inner_outer': self._create_fusion_layer(),
-            'inner_ball': self._create_fusion_layer(),
-            'outer_ball': self._create_fusion_layer(),  # 特别关注这两个表现不佳的类型
-            'inner_outer_ball': self._create_fusion_layer(),  # 特别关注这两个表现不佳的类型
-        })
-
-        # 注意力模块 - 学习重点关注特征的哪些部分
-        self.attention = nn.Sequential(
-            nn.Linear(feature_dim, feature_dim // 4),
-            nn.LayerNorm(feature_dim // 4),
-            nn.LeakyReLU(0.2),
-            nn.Linear(feature_dim // 4, feature_dim),
-            nn.Sigmoid()
-        )
-
-    def _create_fusion_layer(self):
-        """创建融合层"""
-        return nn.Sequential(
-            nn.Linear(self.feature_dim, self.feature_dim * 2),
-            nn.LayerNorm(self.feature_dim * 2),
-            nn.LeakyReLU(0.2),
-            nn.Dropout(0.2),
-            nn.Linear(self.feature_dim * 2, self.feature_dim),
-            nn.LayerNorm(self.feature_dim),
-        )
-
-    def forward(self, x, fault_type):
-        """应用特定于复合故障类型的融合"""
-        if fault_type in self.compound_layers:
-            # 计算注意力权重
-            attention_weights = self.attention(x)
-
-            # 应用融合变换
-            fusion_features = self.compound_layers[fault_type](x)
-
-            # 根据注意力融合
-            return x + attention_weights * (fusion_features - x)
-        return x
 
 
 class ResidualBlock1D(nn.Module):
@@ -1725,58 +1280,52 @@ class ResidualBlock1D(nn.Module):
         out = self.conv2(out)
         out = self.bn2(out)
 
-        out += identity  # 残差连接
+        if identity.shape == out.shape:
+            out += identity
+        else:
+            print(
+                f"Warning: Skipping residual connection in ResidualBlock1D due to shape mismatch: identity {identity.shape}, out {out.shape}")
+
         out = self.relu(out)
         return out
 
 
 class AEDataSemanticCNN(nn.Module):
-    def __init__(self, input_length=SEGMENT_LENGTH, semantic_dim=32,  # 固定32维
-                 num_classes=8, feature_dim=CNN_FEATURE_DIM, dropout_rate=0.3):
+    def __init__(self, input_length=SEGMENT_LENGTH, semantic_dim=AE_LATENT_DIM,
+                 num_classes=8, feature_dim=CNN_FEATURE_DIM, dropout_rate=0.3):  # Added dropout_rate
         super().__init__()
         self.input_length = input_length
-        self.semantic_dim = 32  # 固定为32
+        self.semantic_dim = semantic_dim
         self.feature_dim = feature_dim
-
-        # 信号编码器保持不变
         self.signal_encoder = nn.Sequential(
-            nn.Conv1d(1, 64, kernel_size=15, stride=2, padding=7),
+            nn.Conv1d(1, 64, kernel_size=15, stride=2, padding=7),  # L/2
             nn.BatchNorm1d(64),
             nn.LeakyReLU(0.1),
-            nn.MaxPool1d(kernel_size=2, stride=2),
+            nn.MaxPool1d(kernel_size=2, stride=2),  # L/4
 
             ResidualBlock1D(64, 64),
 
-            nn.Conv1d(64, 128, kernel_size=7, stride=2, padding=3),
+            nn.Conv1d(64, 128, kernel_size=7, stride=2, padding=3),  # L/8
             nn.BatchNorm1d(128),
             nn.LeakyReLU(0.1),
+            nn.MaxPool1d(kernel_size=2, stride=2),  # L/16
 
             ResidualBlock1D(128, 128),
 
-            nn.Conv1d(128, self.feature_dim, kernel_size=5, stride=2, padding=2),
+            nn.Conv1d(128, self.feature_dim, kernel_size=5, stride=2, padding=2),  # L/32
             nn.BatchNorm1d(self.feature_dim),
             nn.LeakyReLU(0.1),
 
             ResidualBlock1D(self.feature_dim, self.feature_dim),
             nn.AdaptiveAvgPool1d(1)
         )
-
-        # 语义处理器 - 适配32维输入
         self.semantic_processor = nn.Sequential(
-            nn.Linear(32, 64),  # 32维输入
-            nn.LayerNorm(64),
+            nn.Linear(self.semantic_dim, (self.feature_dim + self.semantic_dim) // 2),
+            nn.LayerNorm((self.feature_dim + self.semantic_dim) // 2),
             nn.LeakyReLU(0.1),
             nn.Dropout(dropout_rate),
-
-            nn.Linear(64, 128),
-            nn.LayerNorm(128),
-            nn.LeakyReLU(0.1),
-            nn.Dropout(dropout_rate),
-
-            nn.Linear(128, 2 * self.feature_dim)  # 输出gamma和beta
+            nn.Linear((self.feature_dim + self.semantic_dim) // 2, 2 * self.feature_dim)
         )
-
-        # 分类头
         self.classifier_head = nn.Sequential(
             nn.LayerNorm(self.feature_dim),
             nn.Dropout(min(dropout_rate + 0.1, 0.7)),
@@ -1784,61 +1333,88 @@ class AEDataSemanticCNN(nn.Module):
         )
 
     def forward(self, x, semantic, return_features=False):
-        """前向传播 - 适配32维语义输入"""
+        """
+        Forward pass with FiLM modulation.
+        x: signal input [B, L] or [B, 1, L]
+        semantic: semantic input from AE [B, semantic_dim (AE_LATENT_DIM)]
+        """
         if x.dim() == 2:
-            x = x.unsqueeze(1)
+            x = x.unsqueeze(1)  # Ensure [B, 1, L] for Conv1d
 
-        # 信号特征提取
-        signal_features = self.signal_encoder(x).squeeze(-1)  # [B, feature_dim]
+        signal_features = self.signal_encoder(x).squeeze(-1)  # Output: [B, feature_dim]
 
         if semantic is None:
-            raise ValueError("Semantic input cannot be None")
 
-        # 确保语义输入是32维
-        if semantic.shape[1] != 32:
-            raise ValueError(f"Expected 32-dim semantic input, got {semantic.shape[1]}")
+            gamma = torch.zeros_like(signal_features)
+            beta = torch.zeros_like(signal_features)
+        else:
+            if semantic.shape[1] != self.semantic_dim:
+                raise ValueError(
+                    f"AEDataSemanticCNN: Semantic input dim mismatch. Expected {self.semantic_dim}, got {semantic.shape[1]}")
 
-        # 生成FiLM参数
-        film_params = self.semantic_processor(semantic)
-        gamma = film_params[:, :self.feature_dim]
-        beta = film_params[:, self.feature_dim:]
+            film_params = self.semantic_processor(semantic)  # semantic is AE's output
+            gamma = film_params[:, :self.feature_dim]
+            beta = film_params[:, self.feature_dim:]
 
-        # 应用FiLM调制
         modulated_features = (1 + gamma) * signal_features + beta
 
         if return_features:
             return modulated_features
 
         logits = self.classifier_head(modulated_features)
-        return logits, modulated_features
+        return logits
+class SemanticAutoencoder(nn.Module):
+    def __init__(self, feature_dim, semantic_dim):
+        super().__init__()
+        self.feature_dim = feature_dim
+        self.semantic_dim = semantic_dim
+        self.projection_H = nn.Linear(feature_dim, semantic_dim)
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.xavier_uniform_(self.projection_H.weight)
+        if self.projection_H.bias is not None:
+            nn.init.zeros_(self.projection_H.bias)
+
+    def forward(self, x_features):
+        projected_semantics = self.projection_H(x_features)
+        return projected_semantics
+
+    def reconstruct_features(self, a_semantics):
+        reconstructed_x = F.linear(a_semantics, self.projection_H.weight.t(), bias=None)
+        return reconstructed_x
 
 
 class ZeroShotCompoundFaultDiagnosis:
 
     def __init__(self, data_path, sample_length=SEGMENT_LENGTH, latent_dim=AE_LATENT_DIM,
-                 batch_size=DEFAULT_BATCH_SIZE,cnn_dropout_rate=0.3,
-                 compound_data_semantic_generation_rule='mapper_output'):  # Added new parameter with default
+                 batch_size=DEFAULT_BATCH_SIZE, cnn_dropout_rate=0.3,
+                 compound_data_semantic_generation_rule='mapper_output',
+                 sae_mu=SAE_MU, sampling_frequency=SAMPLING_FREQUENCY_HZ):
         self.data_path = data_path
         self.sample_length = sample_length
-        self.latent_dim_config = latent_dim
+        self.ae_latent_dim_config = latent_dim
         self.batch_size = batch_size
         self.cnn_dropout_rate = cnn_dropout_rate
         self.compound_data_semantic_generation_rule = compound_data_semantic_generation_rule
+        self.sae_mu = sae_mu
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
-        self.preprocessor = DataPreprocessor(sample_length=self.sample_length)
+        # Initialize preprocessor with sampling frequency
+        self.preprocessor = DataPreprocessor(sample_length=self.sample_length, sampling_frequency=sampling_frequency)
+        # Initialize semantic builder with the correct latent_dim for the AE
         self.semantic_builder = FaultSemanticBuilder(
-            latent_dim=self.latent_dim_config,
-            compound_data_semantic_generation_rule=self.compound_data_semantic_generation_rule  # Pass the rule
+            latent_dim=self.ae_latent_dim_config,
+            compound_data_semantic_generation_rule=self.compound_data_semantic_generation_rule
         )
         self.fault_types = {
             'normal': 0, 'inner': 1, 'outer': 2, 'ball': 3,
             'inner_outer': 4, 'inner_ball': 5, 'outer_ball': 6, 'inner_outer_ball': 7
         }
         self.idx_to_fault = {v: k for k, v in self.fault_types.items()}
-        self.semantic_builder.idx_to_fault = self.idx_to_fault  # Ensure idx_to_fault is set in builder
-        self.single_fault_types_ordered = ['normal', 'inner', 'outer', 'ball']  # For consistency
-        self.compound_fault_definitions = {  # Central definition
+        self.semantic_builder.idx_to_fault = self.idx_to_fault
+        self.single_fault_types_ordered = ['normal', 'inner', 'outer', 'ball']
+        self.compound_fault_definitions = {
             'inner_outer': ['inner', 'outer'],
             'inner_ball': ['inner', 'ball'],
             'outer_ball': ['outer', 'ball'],
@@ -1846,546 +1422,468 @@ class ZeroShotCompoundFaultDiagnosis:
         }
         self.compound_fault_types = list(self.compound_fault_definitions.keys())
         self.num_classes = len(self.fault_types)
+
         self.cnn_model = None
-        self.embedding_net = None
-        self.actual_latent_dim = -1
-        self.cnn_feature_dim = -1
-        self.fused_semantic_dim = -1
-        self.consistency_loss_fn = None
+        self.sae_model = None
+
+        self.actual_ae_latent_dim = -1
+        self.cnn_feature_dim = CNN_FEATURE_DIM
+        self.fused_semantic_dim = -1 # This will be knowledge_dim (3) + AE_LATENT_DIM
+
+        # Store preprocessed data and ratios for later use
+        self.processed_single_segments = None
+        self.processed_single_hf_lf_ratios = None
+        self.processed_single_labels = None
+        self.processed_pseudo_compound_segments = None
+        self.processed_pseudo_compound_hf_lf_ratios = None
+        self.processed_pseudo_compound_labels = None
 
     def load_data(self):
         """改进的数据加载函数，确保每类故障样本数量一致且训练集验证集同样平衡"""
         print("加载并预处理数据，确保训练和测试集严格分离，且类别平衡...")
-
-        # Define single and compound fault types
         single_fault_keys = ['normal', 'inner', 'outer', 'ball']
-        compound_fault_keys = ['inner_outer', 'inner_ball', 'outer_ball', 'inner_outer_ball']
 
-        # Define file paths for each fault type
         fault_files = {
-            'normal': os.path.join('Simple Fault', '1 Normal', 'f600', 'rpm1200_f600', 'rpm1200_f600_01.mat'),
-            'inner': os.path.join('Simple Fault', '2 IF', 'f600', 'rpm1200_f600', 'rpm1200_f600_01.mat'),
-            'outer': os.path.join('Simple Fault', '3 OF', 'f600', 'rpm1200_f600', 'rpm1200_f600_01.mat'),
-            'ball': os.path.join('Simple Fault', '4 BF', 'f600', 'rpm1200_f600', 'rpm1200_f600_01.mat'),
-            'inner_outer': os.path.join('Compound Fault', '1 IF&OF', 'f600', 'rpm1200_f600', 'rpm1200_f600_01.mat'),
-            'inner_ball': os.path.join('Compound Fault', '2 IF&BF', 'f600', 'rpm1200_f600', 'rpm1200_f600_01.mat'),
-            'outer_ball': os.path.join('Compound Fault', '3 OF&BF', 'f600', 'rpm1200_f600', 'rpm1200_f600_01.mat'),
-            'inner_outer_ball': os.path.join('Compound Fault', '5 IF&OF&BF', 'f600', 'rpm1200_f600',
-                                             'rpm1200_f600_01.mat')
+            'normal': 'normal.mat', 'inner': 'inner.mat', 'outer': 'outer.mat', 'ball': 'ball.mat',
+            'inner_outer': 'inner_outer.mat', 'inner_ball': 'inner_ball.mat',
+            'outer_ball': 'outer_ball.mat', 'inner_outer_ball': 'inner_outer_ball.mat'
         }
 
-        # Initialize storage for raw signals
         single_fault_raw_signals = {}
-        compound_fault_raw_signals = {}
+        compound_fault_raw_signals = {}  # These are real compound fault signals
 
-        # Step 1: Load all data files
-        for fault_type, relative_path in fault_files.items():
-            file_path = os.path.join(self.data_path, relative_path)
-            print(f"加载 {fault_type} 数据，来源: {file_path}...")
+        for fault_type, file_name in fault_files.items():
+            file_path = os.path.join(self.data_path, file_name)
+            print(f"加载 {fault_type} 数据，来源: {file_name}...")
             if not os.path.exists(file_path):
                 print(f"警告: 文件不存在: {file_path}，跳过。")
                 continue
             try:
                 mat_data = sio.loadmat(file_path)
-                # Assume data is in a matrix; we need the fourth column
                 signal_data_raw = None
-                # Find the first non-header key with a large enough array
                 potential_keys = [k for k in mat_data if not k.startswith('__') and
-                                  isinstance(mat_data[k], np.ndarray) and mat_data[k].size > 500]
+                                  isinstance(mat_data[k], np.ndarray) and mat_data[k].ndim > 0 and mat_data[
+                                      k].size > 500]
+
+                if not potential_keys:
+                    common_keys_order = ['DE_time', 'FE_time', 'BA_time', 'Data']
+                    for ck_part in common_keys_order:
+                        found_key = next((k for k in mat_data if ck_part in k and not k.startswith('__')), None)
+                        if found_key:
+                            potential_keys.append(found_key)
+                            break
+
                 if potential_keys:
-                    data_array = mat_data[potential_keys[0]]
-                    # Check if the array has at least 4 columns
-                    if data_array.shape[1] >= 4:
-                        signal_data_raw = data_array[:, 3]  # Fourth column (index 3)
+                    de_keys = [k for k in potential_keys if 'DE_time' in k]
+                    if de_keys:
+                        signal_data_raw = mat_data[de_keys[0]]  # Pick first DE key
                     else:
-                        print(f"错误: {file_path} 数据阵列列数不足（需要至少4列，实际{data_array.shape[1]}列），跳过。")
-                        continue
-                else:
-                    print(f"错误: {file_path} 中没有合适的数据阵列，跳过。")
-                    continue
-                if signal_data_raw is None:
-                    print(f"错误: {file_path} 中无法提取第四列数据，跳过。")
-                    continue
+                        signal_data_raw = mat_data[max(potential_keys, key=lambda k: mat_data[k].size)]
+
                 signal_data_flat = signal_data_raw.ravel().astype(np.float64)
-                # Limit signal length to avoid memory issues
-                max_len = 200000
+                max_len = 200000  # Limit signal length for performance
                 if len(signal_data_flat) > max_len:
                     signal_data_flat = signal_data_flat[:max_len]
+
                 if fault_type in single_fault_keys:
                     single_fault_raw_signals[fault_type] = signal_data_flat
                 else:
                     compound_fault_raw_signals[fault_type] = signal_data_flat
             except Exception as e:
-                print(f"错误: 加载 {file_path} 时出错: {e}")
+                print(f"错误: 加载 {file_name} 时出错: {e}")
                 traceback.print_exc()
 
         print(f"\n加载完成：")
         print(f"* 单一故障类型: {list(single_fault_raw_signals.keys())}")
         print(f"* 复合故障类型: {list(compound_fault_raw_signals.keys())}")
 
-        # Step 2: Preprocess all single fault data
         print("\n预处理所有单一故障数据...")
+        # Train preprocessor now returns segments and HF/LF ratios
         train_preprocessor = DataPreprocessor(
             sample_length=self.sample_length,
             overlap=0.25,
             augment=True,
-            random_seed=42
+            random_seed=42,
+            sampling_frequency=self.preprocessor.sampling_frequency  # Ensure consistency
         )
 
-        # Preprocess and store segments for each single fault
         all_single_fault_segments_by_type = {}
+        all_single_fault_hf_lf_ratios_by_type = {}
+        min_samples_after_preprocessing = float('inf')
 
         for fault_type, signal_data in single_fault_raw_signals.items():
-            label_idx = self.fault_types[fault_type]
             print(f"预处理 {fault_type} 数据...")
-            processed_segments = train_preprocessor.preprocess(signal_data, augmentation=True)
+            processed_segments, processed_hf_lf_ratios = train_preprocessor.preprocess(signal_data, augmentation=True)
 
             if processed_segments is None or processed_segments.shape[0] == 0:
                 print(f"警告: {fault_type} 数据预处理后无有效分段")
                 continue
 
             all_single_fault_segments_by_type[fault_type] = processed_segments
-            print(f" - {fault_type}: {len(processed_segments)} 个分段")
+            all_single_fault_hf_lf_ratios_by_type[fault_type] = processed_hf_lf_ratios
+            min_samples_after_preprocessing = min(min_samples_after_preprocessing, len(processed_segments))
+            print(f"  - {fault_type}: {len(processed_segments)} 个分段")
 
-        # Balance sample sizes across fault types
-        if not all_single_fault_segments_by_type:
-            print("错误: 没有有效的单一故障数据")
-            return None
-        min_samples = min([len(segments) for segments in all_single_fault_segments_by_type.values()])
-        print(f"\n平衡各单一故障类型样本数量至每类 {min_samples} 个样本")
+        print(
+            f"\n平衡各单一故障类型样本数量至每类 {min_samples_after_preprocessing} 个样本 (基于预处理和增强后的最少样本数)")
 
-        # Define train-validation split ratio
         train_ratio = 0.7
-        samples_per_class_train = int(min_samples * train_ratio)
-        samples_per_class_val = min_samples - samples_per_class_train
+        samples_per_class_train = int(min_samples_after_preprocessing * train_ratio)
+        samples_per_class_val = min_samples_after_preprocessing - samples_per_class_train
 
         print(f"每类故障分配: {samples_per_class_train}个训练样本, {samples_per_class_val}个验证样本")
 
-        # Initialize train and validation sets
         X_train_list = []
         y_train_list = []
+        hf_lf_train_list = []  # Store HF/LF ratios for training
         X_val_list = []
         y_val_list = []
+        hf_lf_val_list = []  # Store HF/LF ratios for validation
 
-        # Split each fault type into train and validation sets
         for fault_type, segments in all_single_fault_segments_by_type.items():
             label_idx = self.fault_types[fault_type]
-            # Shuffle indices
-            indices = np.random.permutation(len(segments))
+            num_available_segments = len(segments)
+            current_samples_train = min(samples_per_class_train, num_available_segments)
+            current_samples_val = min(samples_per_class_val, num_available_segments - current_samples_train)
 
-            # Select fixed number of samples for train and validation
-            train_indices = indices[:samples_per_class_train]
-            val_indices = indices[samples_per_class_train:min_samples]
+            indices = np.random.permutation(num_available_segments)
+            train_indices = indices[:current_samples_train]
+            val_indices = indices[current_samples_train: current_samples_train + current_samples_val]
 
-            # Add to respective lists
-            X_train_list.append(segments[train_indices])
-            y_train_list.extend([label_idx] * samples_per_class_train)
+            if len(train_indices) > 0:
+                X_train_list.append(segments[train_indices])
+                y_train_list.extend([label_idx] * len(train_indices))
+                hf_lf_train_list.append(all_single_fault_hf_lf_ratios_by_type[fault_type][train_indices])
 
-            X_val_list.append(segments[val_indices])
-            y_val_list.extend([label_idx] * samples_per_class_val)
+            if len(val_indices) > 0:
+                X_val_list.append(segments[val_indices])
+                y_val_list.extend([label_idx] * len(val_indices))
+                hf_lf_val_list.append(all_single_fault_hf_lf_ratios_by_type[fault_type][val_indices])
 
-            print(f" - {fault_type}: 训练 {len(train_indices)} 个, 验证 {len(val_indices)} 个")
-
-        # Combine train and validation sets
-        if not X_train_list or not X_val_list:
-            print("错误: 无法创建训练集和验证集")
-            return None
+            print(f"  - {fault_type}: 训练 {len(train_indices)} 个, 验证 {len(val_indices)} 个")
 
         X_train = np.vstack(X_train_list)
         y_train = np.array(y_train_list)
-        X_val = np.vstack(X_val_list)
-        y_val = np.array(y_val_list)
+        hf_lf_train = np.vstack(hf_lf_train_list)
+
+        X_val = np.vstack(X_val_list) if X_val_list else np.empty((0, self.sample_length), dtype=np.float32)
+        y_val = np.array(y_val_list) if y_val_list else np.array([], dtype=int)
+        hf_lf_val = np.vstack(hf_lf_val_list) if hf_lf_val_list else np.empty((0, 2), dtype=np.float32)
+
+        # Store these for AttributeMapper training later
+        self.processed_single_segments = X_train
+        self.processed_single_hf_lf_ratios = hf_lf_train
+        self.processed_single_labels = y_train
 
         print(f"\n数据集划分完成:")
-        print(f"* 训练集: {len(X_train)} 个样本, 每类 {samples_per_class_train} 个")
-        print(f"* 验证集: {len(X_val)} 个样本, 每类 {samples_per_class_val} 个")
+        print(f"* 训练集: {len(X_train)} 个样本")
+        if len(X_train) > 0: print(f"  - 形状: {X_train.shape}")
+        print(f"* 验证集: {len(X_val)} 个样本")
+        if len(X_val) > 0: print(f"  - 形状: {X_val.shape}")
 
-        # Step 3: Process test set (compound faults, no augmentation)
+        # --- NEW: Pseudo Compound Fault Data Generation (for AttributeMapper training) ---
+        # This is a placeholder for generating synthetic compound fault data
+        # In a real scenario, you'd implement logic to combine single fault signals
+        # and then preprocess them to get segments and their HF/LF ratios.
+        print("\n生成伪复合故障数据 (用于 AttributeSemanticMapper 训练)...")
+        self.processed_pseudo_compound_segments, self.processed_pseudo_compound_hf_lf_ratios, self.processed_pseudo_compound_labels = \
+            self._generate_pseudo_compound_data(single_fault_raw_signals)
+        print(f"  - 伪复合训练样本: {len(self.processed_pseudo_compound_segments)} 个")
+
+        # --- NEW: Calculate average HF/LF for pseudo compound types (for synthesizing prototypes) ---
+        pseudo_compound_hf_lf_ratios_avg = {}
+        if self.processed_pseudo_compound_segments.shape[0] > 0:
+            for fault_name, _ in self.compound_fault_definitions.items():
+                lbl_idx = self.fault_types[fault_name]
+                mask = (self.processed_pseudo_compound_labels == lbl_idx)
+                if np.any(mask):
+                    avg_hf = np.mean(self.processed_pseudo_compound_hf_lf_ratios[mask, 0])
+                    avg_lf = np.mean(self.processed_pseudo_compound_hf_lf_ratios[mask, 1])
+                    pseudo_compound_hf_lf_ratios_avg[fault_name] = [avg_hf, avg_lf]
+        self.pseudo_compound_hf_lf_ratios_avg = pseudo_compound_hf_lf_ratios_avg
+
+        # 第四步：处理测试集（复合故障，无增强）
         test_preprocessor = DataPreprocessor(
             sample_length=self.sample_length,
             overlap=0.5,
             augment=False,
-            random_seed=44
+            random_seed=44,
+            sampling_frequency=self.preprocessor.sampling_frequency  # Consistency
         )
 
         X_test_list = []
         y_test_list = []
+        hf_lf_test_list = []  # Store HF/LF ratios for test set
 
         print("\n处理测试集（复合故障，无增强）:")
+        if not compound_fault_raw_signals:
+            print("警告: 没有加载复合故障原始信号数据，测试集将为空。")
+
         for fault_type, signal_data in compound_fault_raw_signals.items():
             label_idx = self.fault_types[fault_type]
-            processed_segments = test_preprocessor.preprocess(signal_data, augmentation=False)
+            processed_segments, processed_hf_lf_ratios = test_preprocessor.preprocess(signal_data, augmentation=False)
             if processed_segments is None or processed_segments.shape[0] == 0:
                 print(f"警告: {fault_type} 测试数据预处理后无有效分段")
                 continue
             X_test_list.append(processed_segments)
             y_test_list.extend([label_idx] * len(processed_segments))
-            print(f" - {fault_type}: {len(processed_segments)} 个分段")
+            hf_lf_test_list.append(processed_hf_lf_ratios)
+            print(f"  - {fault_type}: {len(processed_segments)} 个分段")
 
         X_test = np.vstack(X_test_list) if X_test_list else np.empty((0, self.sample_length), dtype=np.float32)
-        y_test = np.array(y_test_list) if y_test_list else np.array([])
+        y_test = np.array(y_test_list) if y_test_list else np.array([], dtype=int)
+        hf_lf_test = np.vstack(hf_lf_test_list) if hf_lf_test_list else np.empty((0, 2), dtype=np.float32)
 
-        # Step 4: Dataset statistics
+        # Store test data and their HF/LF ratios
+        self.X_test_signals = X_test
+        self.y_test_labels = y_test
+        self.hf_lf_test_ratios = hf_lf_test
+
+        # 统计数据分布
         train_dist = dict(Counter([self.idx_to_fault.get(y, f"Unknown_{y}") for y in y_train]))
         val_dist = dict(Counter([self.idx_to_fault.get(y, f"Unknown_{y}") for y in y_val]))
         test_dist = dict(Counter([self.idx_to_fault.get(y, f"Unknown_{y}") for y in y_test]))
 
         print("\n数据集统计:")
-        print(f"* 训练集: {len(X_train)} 个样本")
-        print(f" - 分布: {train_dist}")
-        print(f"* 验证集: {len(X_val)} 个样本")
-        print(f" - 分布: {val_dist}")
-        print(f"* 测试集: {len(X_test)} 个样本")
-        print(f" - 分布: {test_dist}")
+        print(f"* 训练集 (单一故障): {len(X_train)} 个样本")
+        print(f"  - 分布: {train_dist}")
+        print(f"* 验证集 (单一故障): {len(X_val)} 个样本")
+        print(f"  - 分布: {val_dist}")
+        print(f"* 伪复合训练集: {len(self.processed_pseudo_compound_segments)} 个样本")
+        print(
+            f"  - 分布: {dict(Counter([self.idx_to_fault.get(y, f'Unknown_{y}') for y in self.processed_pseudo_compound_labels]))}")
+        print(f"* 测试集 (真实复合故障): {len(X_test)} 个样本")
+        print(f"  - 分布: {test_dist}")
 
         return {
-            'X_train': X_train, 'y_train': y_train,
-            'X_val': X_val, 'y_val': y_val,
-            'X_test': X_test, 'y_test': y_test
+            'X_train': X_train, 'y_train': y_train, 'hf_lf_train': hf_lf_train,
+            'X_val': X_val, 'y_val': y_val, 'hf_lf_val': hf_lf_val,
+            'X_test': X_test, 'y_test': y_test, 'hf_lf_test': hf_lf_test
         }
+
+    def _generate_pseudo_compound_data(self, single_fault_raw_signals, num_samples_per_type=200):
+        """
+        Generates pseudo-compound fault segments by simple summation of single fault signals.
+        This is a simplified approach; more advanced methods (e.g., frequency mixing,
+        realistic noise addition) could be used.
+        """
+        print("--- Generating Pseudo Compound Data ---")
+        pseudo_segments_list = []
+        pseudo_labels_list = []
+        pseudo_hf_lf_ratios_list = []
+
+        # Use a dedicated preprocessor for pseudo-compound data
+        pseudo_preprocessor = DataPreprocessor(
+            sample_length=self.sample_length,
+            overlap=0.5,  # Less overlap for pseudo data
+            augment=False,  # No augmentation for base pseudo signals
+            random_seed=43,
+            sampling_frequency=self.preprocessor.sampling_frequency
+        )
+
+        single_signal_data = {}
+        for ft in self.single_fault_types_ordered:
+            if ft != 'normal' and ft in single_fault_raw_signals:
+                single_signal_data[ft] = single_fault_raw_signals[ft]
+
+        # Ensure single fault data is available for combination
+        if not single_signal_data:
+            print("Warning: No single fault raw signals available to generate pseudo-compound data.")
+            return np.empty((0, self.sample_length)), np.empty((0, 2)), np.empty((0,), dtype=int)
+
+        for cf_name, constituents in self.compound_fault_definitions.items():
+            if len(constituents) < 2: continue  # Only combine 2 or more single faults
+
+            print(f"  Generating pseudo {cf_name}...")
+            combined_signals_raw = []
+
+            # For simplicity, let's take a small chunk from each constituent
+            # and sum them up. Ensure the chunks are long enough for segmentation.
+            max_seg_len = max(len(single_signal_data.get(c, [])) for c in constituents)
+            if max_seg_len < self.sample_length * 2:  # Need enough data for at least 2 segments
+                print(f"Warning: Constituent signals too short for {cf_name}. Skipping pseudo generation.")
+                continue
+
+            for _ in range(num_samples_per_type):
+                # Pick random starting points from each constituent signal
+                combined_signal_chunk = np.zeros(
+                    self.sample_length * 2)  # Create a chunk large enough for a few segments
+                valid_constituents_for_mix = True
+                for c_name in constituents:
+                    if c_name not in single_signal_data:
+                        valid_constituents_for_mix = False
+                        break
+
+                    raw_signal = single_signal_data[c_name]
+                    if len(raw_signal) < self.sample_length * 2:
+                        valid_constituents_for_mix = False
+                        break
+
+                    start_idx = np.random.randint(0, len(raw_signal) - self.sample_length * 2 + 1)
+                    combined_signal_chunk += raw_signal[start_idx: start_idx + self.sample_length * 2]
+
+                if not valid_constituents_for_mix: continue
+
+                combined_signals_raw.append(combined_signal_chunk)
+
+            if not combined_signals_raw:
+                print(f"  Skipped {cf_name} due to insufficient raw data.")
+                continue
+
+            combined_signals_raw = np.array(combined_signals_raw).flatten()  # Treat as one long signal for processing
+
+            # Preprocess the combined raw signal to get segments and their ratios
+            processed_pseudo_segments, processed_pseudo_hf_lf_ratios = \
+                pseudo_preprocessor.preprocess(combined_signals_raw, augmentation=False, scale_globally=True)
+
+            if processed_pseudo_segments.shape[0] > 0:
+                # Limit number of pseudo segments generated per type to avoid imbalance
+                num_to_add = min(num_samples_per_type, processed_pseudo_segments.shape[0])
+                random_indices = np.random.choice(processed_pseudo_segments.shape[0], num_to_add, replace=False)
+
+                pseudo_segments_list.append(processed_pseudo_segments[random_indices])
+                pseudo_labels_list.extend([self.fault_types[cf_name]] * num_to_add)
+                pseudo_hf_lf_ratios_list.append(processed_pseudo_hf_lf_ratios[random_indices])
+
+        if not pseudo_segments_list:
+            print("No pseudo compound data generated.")
+            return np.empty((0, self.sample_length)), np.empty((0, 2)), np.empty((0,), dtype=int)
+
+        return np.vstack(pseudo_segments_list), np.vstack(pseudo_hf_lf_ratios_list), np.array(pseudo_labels_list)
 
     def build_semantics(self, data_dict):
         """Builds knowledge and data semantics (AE training aligned with gen.py)."""
         print("Building fault semantics...")
-        knowledge_semantics = self.semantic_builder.build_knowledge_semantics()
 
+        # 1. Build base knowledge semantics (3-dim location)
+        knowledge_semantics = self.semantic_builder.build_knowledge_semantics()
         print(f"  Knowledge semantics built. Dimension: {self.semantic_builder.knowledge_dim}")
 
+        # 2. Train Autoencoder
         print("  Training autoencoder for data semantics...")
-        X_train_ae = data_dict.get('X_train')
-        y_train_ae = data_dict.get('y_train')
+        X_train_ae = data_dict.get('X_train')  # Segments
+        y_train_ae = data_dict.get('y_train')  # Labels for AE contrastive loss
+
         self.semantic_builder.train_autoencoder(X_train_ae, labels=y_train_ae, epochs=AE_EPOCHS,
-                                                    batch_size=AE_BATCH_SIZE, lr=AE_LR)
+                                                batch_size=AE_BATCH_SIZE, lr=AE_LR)
+        self.actual_ae_latent_dim = self.semantic_builder.actual_latent_dim
 
-        self.actual_latent_dim = self.semantic_builder.actual_latent_dim
+        # 3. Train AttributeSemanticMapper
+        print("\n  Training AttributeSemanticMapper with 5-dim attributes...")
+        self.semantic_builder.train_attribute_mapper(
+            single_fault_segments=self.processed_single_segments,
+            single_fault_labels=self.processed_single_labels,
+            single_fault_hf_lf_ratios=self.processed_single_hf_lf_ratios,
+            pseudo_compound_segments=self.processed_pseudo_compound_segments,
+            pseudo_compound_labels=self.processed_pseudo_compound_labels,
+            pseudo_compound_hf_lf_ratios=self.processed_pseudo_compound_hf_lf_ratios,
+            ae_model=self.semantic_builder.autoencoder,
+            epochs=200,  # More epochs for mapper
+            batch_size=self.batch_size,
+            lr=0.001,
+            lambda_compound=1.0
+        )
+        # Attribute mapper is now trained and loaded into self.semantic_builder.attribute_mapper
 
-        single_fault_prototypes = self.semantic_builder.data_semantics
-        print(f"  Data semantic prototypes learned. Dimension: {self.actual_latent_dim}")
-        # 合成复合故障语义原型
-        compound_data_semantics = self.semantic_builder.synthesize_compound_semantics(single_fault_prototypes)
-        print(f"  Compound data semantics synthesized for {len(compound_data_semantics)} types.")
-        # 合并所有数据语义原型 (单一+复合)
+        # 4. Extract Data Semantic Prototypes (from AE) for single faults
+        # These are the centroids computed by AE, before Mapper is used
+        single_fault_prototypes = self.semantic_builder.data_semantics  # This is from AE training
+        print(f"  Data semantic prototypes learned for single faults (from AE). Dimension: {self.actual_ae_latent_dim}")
+
+        # 5. Synthesize Compound Data Semantics (using the trained AttributeSemanticMapper)
+        compound_data_semantics = self.semantic_builder.synthesize_compound_semantics(
+            single_fault_prototypes,
+            pseudo_compound_hf_lf_ratios_avg=self.pseudo_compound_hf_lf_ratios_avg  # Pass average HF/LF for prototypes
+        )
+        print(
+            f"  Compound data semantics synthesized for {len(compound_data_semantics)} types using AttributeSemanticMapper.")
+
+        # 6. Combine all data-only semantics (single + synthesized compound)
         data_only_semantics = {**single_fault_prototypes, **compound_data_semantics}
+
+        # 7. Fuse Knowledge Semantics (3-dim) and Data Semantics (AE_LATENT_DIM)
         fused_semantics = {}
-        self.fused_semantic_dim = self.semantic_builder.knowledge_dim + 32
+        self.fused_semantic_dim = self.semantic_builder.knowledge_dim + self.actual_ae_latent_dim  # 3 + AE_LATENT_DIM
+        print(
+            f"  Fused semantic dimension will be: {self.fused_semantic_dim} (Knowledge: {self.semantic_builder.knowledge_dim} + AE_Data: {self.actual_ae_latent_dim})")
+
         for ft, k_vec in knowledge_semantics.items():
             d_vec = data_only_semantics.get(ft)
-            if (d_vec is not None and k_vec is not None and
-                    np.all(np.isfinite(k_vec)) and np.all(np.isfinite(d_vec)) and
-                    len(k_vec) == self.semantic_builder.knowledge_dim and len(d_vec) == 32):
 
-                # 直接拼接：[3] + [32] = [35]
+            if d_vec is not None and k_vec is not None and \
+                    np.all(np.isfinite(k_vec)) and np.all(np.isfinite(d_vec)) and \
+                    len(k_vec) == self.semantic_builder.knowledge_dim and \
+                    len(d_vec) == self.actual_ae_latent_dim:
                 fused_vec = np.concatenate([k_vec, d_vec]).astype(np.float32)
+
                 if np.all(np.isfinite(fused_vec)) and len(fused_vec) == self.fused_semantic_dim:
                     fused_semantics[ft] = fused_vec
-        single_fault_latent_features = self.semantic_builder.all_latent_features
-        single_fault_latent_labels = self.semantic_builder.all_latent_labels
+                else:
+                    print(
+                        f"W: Fused vector for '{ft}' is invalid or has wrong dimension after concatenation. k_len={len(k_vec)}, d_len={len(d_vec)}, expected_fused={self.fused_semantic_dim}")
+
+        # Fallback for any missing fused semantics
+        for ft_name in self.fault_types.keys():
+            if ft_name not in fused_semantics:
+                print(f"Warning: Fused semantic for '{ft_name}' not generated. Attempting fallback.")
+                k_fallback = knowledge_semantics.get(ft_name)
+                d_fallback = None
+                if ft_name in single_fault_prototypes and np.all(np.isfinite(single_fault_prototypes[ft_name])):
+                    d_fallback = single_fault_prototypes[ft_name]
+                elif ft_name in compound_data_semantics and np.all(np.isfinite(compound_data_semantics[ft_name])):
+                    d_fallback = compound_data_semantics[ft_name]
+                else:  # Last resort for d_vec if not found
+                    if self.actual_ae_latent_dim > 0:
+                        d_fallback = np.zeros(self.actual_ae_latent_dim, dtype=np.float32)
+                        print(f"  Using zero vector for AE semantic part of '{ft_name}' in fallback.")
+
+                if k_fallback is not None and d_fallback is not None and \
+                        len(k_fallback) == self.semantic_builder.knowledge_dim and \
+                        len(d_fallback) == self.actual_ae_latent_dim:
+                    fused_vec_fallback = np.concatenate([k_fallback, d_fallback]).astype(np.float32)
+                    if np.all(np.isfinite(fused_vec_fallback)) and len(fused_vec_fallback) == self.fused_semantic_dim:
+                        fused_semantics[ft_name] = fused_vec_fallback
+                        print(f"  Successfully created fallback fused semantic for '{ft_name}'.")
+                    else:
+                        print(f"  Error: Fallback fused semantic for '{ft_name}' is invalid.")
+                else:
+                    print(
+                        f"  Error: Could not create fallback fused semantic for '{ft_name}' due to missing components.")
+
         return {
             'knowledge_semantics': knowledge_semantics,
-            'data_prototypes': single_fault_prototypes,  # 单一故障原型
-            'compound_data_semantics': compound_data_semantics,  # 合成复合故障原型
-            'data_only_semantics': data_only_semantics,  # 所有原型
-            'fused_semantics': fused_semantics,
-            # --- 新增返回项 ---
-            'single_fault_latent_features': single_fault_latent_features,
-            'single_fault_latent_labels': single_fault_latent_labels
+            'data_prototypes': single_fault_prototypes,
+            'compound_data_semantics': compound_data_semantics,
+            'data_only_semantics': data_only_semantics,  # AE latent space prototypes
+            'fused_semantics': fused_semantics,  # knowledge + AE latent space prototypes
+            'single_fault_latent_features': self.semantic_builder.all_latent_features,
+            # All AE latent features from training
+            'single_fault_latent_labels': self.semantic_builder.all_latent_labels
         }
-
-    def train_semantic_autoencoder(self, data_dict, semantic_dict, epochs=SEN_EPOCHS, lr=SEN_LR):
-        """
-        使用语义自动编码器(SAE)实现特征到语义的投影
-        """
-        print("\n--- 开始训练语义自动编码器(SAE) ---")
-
-        # 将当前神经网络换成SAE
-        self.semantic_encoder = SemanticAutoencoder(
-            feature_dim=self.cnn_feature_dim,
-            semantic_dim=self.fused_semantic_dim,
-            mu=1.0  # 权衡参数
-        ).to(self.device)
-
-        print(f"语义自动编码器初始化:")
-        print(f"  特征维度: {self.cnn_feature_dim}")
-        print(f"  语义维度: {self.fused_semantic_dim}")
-
-        # 数据准备部分
-        X_train, y_train = data_dict['X_train'], data_dict['y_train']
-
-        # 构建特征矩阵和语义矩阵
-        print("提取特征和语义用于SAE训练...")
-
-        # 获取融合语义向量
-        fused_semantics = semantic_dict.get('fused_semantics', {})
-        semantic_vectors_map = {}
-        for fault_name, semantic_vec in fused_semantics.items():
-            if fault_name in self.fault_types and np.all(np.isfinite(semantic_vec)):
-                fault_idx = self.fault_types[fault_name]
-                semantic_vectors_map[fault_idx] = semantic_vec
-
-        # 提取CNN特征
-        self.cnn_model.eval()
-        self.semantic_builder.autoencoder.eval()
-
-        features_list = []
-        semantics_list = []
-        labels_list = []
-
-        batch_size = 64
-
-        with torch.no_grad():
-            for batch_idx in range(0, len(X_train), batch_size):
-                batch_x = torch.FloatTensor(X_train[batch_idx:batch_idx + batch_size]).to(self.device)
-                batch_y = y_train[batch_idx:batch_idx + batch_size]
-
-                # 提取实时语义
-                if batch_x.dim() == 3 and batch_x.shape[1] == 1:
-                    ae_batch_x = batch_x.squeeze(1)
-                elif batch_x.dim() == 2:
-                    ae_batch_x = batch_x
-                else:
-                    print(f"警告: 预料之外的输入形状: {batch_x.shape}，跳过此批次")
-                    continue
-
-                real_time_semantics = self.semantic_builder.autoencoder.encode(ae_batch_x)
-
-                # 提取特征
-                cnn_features = self.cnn_model(batch_x, semantic=real_time_semantics, return_features=True)
-
-                # 对每个样本，检查是否有对应的语义向量
-                for i, label_idx in enumerate(batch_y):
-                    if label_idx in semantic_vectors_map:
-                        feat_vec = cnn_features[i].cpu().numpy()
-                        sem_vec = semantic_vectors_map[label_idx]
-
-                        # 确保向量有效
-                        if np.all(np.isfinite(feat_vec)) and np.all(np.isfinite(sem_vec)):
-                            features_list.append(feat_vec)
-                            semantics_list.append(sem_vec)
-                            labels_list.append(label_idx)
-
-        if not features_list:
-            print("错误: 无法提取特征或语义用于SAE训练")
-            return False
-
-        X_features = np.vstack(features_list)
-        A_semantics = np.vstack(semantics_list)
-
-        print(f"准备了 {len(X_features)} 对特征-语义样本用于SAE训练")
-        print(f"特征矩阵形状: {X_features.shape}, 语义矩阵形状: {A_semantics.shape}")
-
-        # 验证数据是否有效
-        if not np.all(np.isfinite(X_features)) or not np.all(np.isfinite(A_semantics)):
-            print("警告: 数据中包含非有限值，将尝试清理")
-            valid_indices = np.logical_and(
-                np.all(np.isfinite(X_features), axis=1),
-                np.all(np.isfinite(A_semantics), axis=1)
-            )
-            X_features = X_features[valid_indices]
-            A_semantics = A_semantics[valid_indices]
-            print(f"清理后剩余 {len(X_features)} 对有效样本")
-
-        if len(X_features) < 10:  # 至少需要一些样本
-            print("错误: 有效样本太少，无法训练SAE")
-            return False
-
-        try:
-            # 训练SAE
-            print("开始优化投影矩阵...")
-            self.semantic_encoder.fit(X_features, A_semantics, max_iter=min(epochs, 20))  # 限制迭代次数
-
-            # 评估训练结果
-            with torch.no_grad():
-                X_tensor = torch.FloatTensor(X_features).to(self.device)
-                A_tensor = torch.FloatTensor(A_semantics).to(self.device)
-
-                # 编码测试
-                encoded = self.semantic_encoder(X_tensor, mode='encode')
-                encoding_error = torch.mean(torch.sum((encoded - A_tensor) ** 2, dim=1))
-
-                # 重建测试
-                reconstructed = self.semantic_encoder(X_tensor, mode='reconstruct')
-                reconstruction_error = torch.mean(torch.sum((reconstructed - X_tensor) ** 2, dim=1))
-
-            print(f"SAE训练完成!")
-            print(f"平均编码误差: {encoding_error.item():.6f}")
-            print(f"平均重建误差: {reconstruction_error.item():.6f}")
-
-            return True
-
-        except Exception as e:
-            print(f"SAE训练过程中出错: {e}")
-            print("尝试使用备选初始化方法...")
-
-            try:
-                # 使用简单的伪逆法直接初始化SAE权重
-                X_tensor = torch.FloatTensor(X_features).to(self.device)
-                A_tensor = torch.FloatTensor(A_semantics).to(self.device)
-
-                # 使用伪逆法计算投影矩阵
-                XtX = X_features.T @ X_features
-                XtA = X_features.T @ A_semantics
-
-                # 添加正则化以确保稳定性
-                reg = 1e-8 * np.eye(XtX.shape[0])
-                H = np.linalg.solve(XtX + reg, XtA).T
-
-                # 更新SAE权重
-                with torch.no_grad():
-                    self.semantic_encoder.encoder.weight.copy_(torch.FloatTensor(H).to(self.device))
-                    self.semantic_encoder.decoder.weight.copy_(torch.FloatTensor(H.T).to(self.device))
-
-                print("备选初始化方法成功")
-                return True
-
-            except Exception as backup_error:
-                print(f"备选初始化方法失败: {backup_error}")
-                print("将回退到原始双向语义映射方法")
-                return False
-
-    def generate_compound_fault_projections_sae(self, semantic_dict, data_dict):
-        """
-        使用SAE生成复合故障投影
-        SAE将特征投影到语义空间，因此我们这里需要先合成语义，然后生成对应特征
-        """
-        print("\n生成复合故障投影 (SAE方法)...")
-
-        # 获取所有复合故障的语义向量
-        compound_fault_types = self.compound_fault_types
-        print(f"准备为以下{len(compound_fault_types)}种复合故障生成投影: {compound_fault_types}")
-
-        fused_semantics = semantic_dict.get('fused_semantics', {})
-        compound_fused_semantics = {}
-
-        for fault_type in compound_fault_types:
-            if fault_type in fused_semantics:
-                sem_vec = fused_semantics[fault_type]
-                if sem_vec is not None and np.all(np.isfinite(sem_vec)):
-                    compound_fused_semantics[fault_type] = sem_vec
-                else:
-                    print(f"警告: '{fault_type}'的语义向量包含无效值，尝试修复...")
-                    # 尝试从其组成部分重新合成语义
-                    fixed_vec = self._regenerate_compound_semantic(fault_type, fused_semantics)
-                    if fixed_vec is not None:
-                        compound_fused_semantics[fault_type] = fixed_vec
-                        print(f"  - 成功重新合成'{fault_type}'的语义向量")
-                    else:
-                        print(f"  - 无法修复'{fault_type}'的语义向量，跳过")
-
-        print(f"成功获取{len(compound_fused_semantics)}种复合故障的语义向量")
-
-        # 使用SAE从语义到特征投影
-        self.semantic_encoder.eval()
-
-        # 初始化结果字典
-        compound_projections = {}
-        failed_projections = []
-
-        # 投影每个复合故障
-        with torch.no_grad():
-            for fault_type, semantic_vec in compound_fused_semantics.items():
-                # 创建语义向量的多个副本进行冗余投影以提高稳定性
-                projection_attempts = []
-                num_attempts = 5  # 多次尝试以提高稳定性
-
-                for attempt in range(num_attempts):
-                    # 每次尝试添加少量噪声以获得更多样的投影结果
-                    noise_scale = 0.01 * attempt  # 逐渐增加噪声
-                    noised_vec = semantic_vec.copy()
-                    if attempt > 0:  # 第一次使用原始向量
-                        noised_vec += np.random.normal(0, noise_scale, size=len(semantic_vec))
-
-                    # 检查向量的有效性
-                    if not np.all(np.isfinite(noised_vec)):
-                        continue
-
-                    # 转换为张量
-                    semantic_tensor = torch.FloatTensor(noised_vec).unsqueeze(0).to(self.device)
-
-                    # 通过SAE从语义向特征投影 (使用解码模式)
-                    projected_feature = self.semantic_encoder(semantic_tensor, mode='decode')
-
-                    # 验证投影的有效性
-                    if torch.all(torch.isfinite(projected_feature)):
-                        projection_attempts.append(projected_feature.cpu().numpy().squeeze(0))
-
-                # 汇总多次投影结果
-                if projection_attempts:
-                    # 计算有效投影的均值作为最终结果
-                    final_projection = np.mean(projection_attempts, axis=0)
-                    compound_projections[fault_type] = final_projection
-                    print(f"  - '{fault_type}'投影成功 ({len(projection_attempts)}/{num_attempts}次尝试有效)")
-                else:
-                    failed_projections.append(fault_type)
-                    print(f"  - 无法为'{fault_type}'生成有效投影")
-
-        # 尝试为失败的投影通过组分平均生成
-        if failed_projections:
-            print("尝试通过组分平均为失败的投影生成替代方案...")
-            for fault_type in failed_projections:
-                # 分解复合故障名称，获取组成部分
-                components = fault_type.split('_')
-                component_projections = []
-
-                # 收集单一故障的投影
-                for single_fault_type in self.single_fault_types_ordered:
-                    if single_fault_type in components:
-                        # 使用单一故障的语义生成投影
-                        if single_fault_type in fused_semantics:
-                            single_sem = fused_semantics[single_fault_type]
-                            if np.all(np.isfinite(single_sem)):
-                                try:
-                                    single_tensor = torch.FloatTensor(single_sem).unsqueeze(0).to(self.device)
-                                    single_proj = self.semantic_encoder(single_tensor, mode='decode')
-                                    if torch.all(torch.isfinite(single_proj)):
-                                        component_projections.append(single_proj.cpu().numpy().squeeze(0))
-                                except Exception as e:
-                                    print(f"警告: 无法为组分'{single_fault_type}'生成投影: {e}")
-
-                # 如果找到了足够的组分投影，计算它们的平均值
-                if len(component_projections) >= 2:  # 至少需要两个组分
-                    avg_proj = np.mean(component_projections, axis=0)
-                    if np.all(np.isfinite(avg_proj)):
-                        compound_projections[fault_type] = avg_proj
-                        print(f"  - 使用组分平均成功生成'{fault_type}'的投影")
-
-        # 确认生成的投影数量
-        if len(compound_projections) == 0:
-            print("错误: 无有效的复合故障投影生成")
-            return None
-
-        print(f"成功生成{len(compound_projections)}种复合故障投影")
-
-        # 打印相似度矩阵 (用于调试)
-        if len(compound_projections) > 1:
-            print("\n投影相似度矩阵:")
-            fault_types = list(compound_projections.keys())
-            for i in range(len(fault_types)):
-                for j in range(i + 1, len(fault_types)):
-                    v1 = compound_projections[fault_types[i]]
-                    v2 = compound_projections[fault_types[j]]
-                    v1_norm = v1 / np.linalg.norm(v1)
-                    v2_norm = v2 / np.linalg.norm(v2)
-                    sim = np.dot(v1_norm, v2_norm)
-                    print(f"  {fault_types[i]} vs {fault_types[j]}: {sim:.4f}")
-
-        return compound_projections
 
     def train_ae_data_semantic_cnn(self, data_dict, semantic_dict, epochs=CNN_EPOCHS,
                                    batch_size=DEFAULT_BATCH_SIZE, lr=CNN_LR):
-        """使用AE实时提取的语义训练双通道CNN"""
+        """使用AE实时提取的语义训练CNN (FiLM modulation)"""
+        print("训练基于AE实时数据语义的CNN (with FiLM)...")
 
-        print("训练基于AE实时数据语义的双通道CNN...")
+        if self.cnn_model is None:  # Initialize if not done externally
+            self.cnn_model = AEDataSemanticCNN(
+                input_length=self.sample_length,
+                semantic_dim=self.actual_ae_latent_dim,  # FiLM uses AE's latent dim
+                num_classes=self.num_classes,
+                feature_dim=self.cnn_feature_dim,
+                dropout_rate=self.cnn_dropout_rate
+            ).to(self.device)
+        else:
+            self.cnn_model = self.cnn_model.to(self.device)
 
-
-        self.cnn_model = self.cnn_model.to(self.device)
-        self.semantic_builder.autoencoder.eval()  # 确保AE处于评估模式，不进行梯度更新
+        self.semantic_builder.autoencoder.eval()
 
         X_train, y_train = data_dict['X_train'], data_dict['y_train']
         X_val, y_val = data_dict['X_val'], data_dict['y_val']
 
         train_dataset = TensorDataset(torch.FloatTensor(X_train), torch.LongTensor(y_train))
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
-                                  drop_last=True)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
 
         val_loader = None
         if X_val is not None and y_val is not None and len(X_val) > 0:
@@ -2393,7 +1891,7 @@ class ZeroShotCompoundFaultDiagnosis:
             val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
         criterion = nn.CrossEntropyLoss()
-        optimizer = optim.AdamW(self.cnn_model.parameters(), lr=lr, weight_decay=1e-4)  # Example weight_decay
+        optimizer = optim.AdamW(self.cnn_model.parameters(), lr=lr, weight_decay=1e-4)
         scheduler = optim.lr_scheduler.OneCycleLR(
             optimizer, max_lr=lr, steps_per_epoch=len(train_loader),
             epochs=epochs, pct_start=0.3
@@ -2402,6 +1900,7 @@ class ZeroShotCompoundFaultDiagnosis:
         best_val_acc = 0.0
         best_val_loss_at_best_acc = float('inf')
         patience, patience_counter = 10, 0
+
         for epoch in range(epochs):
             self.cnn_model.train()
             train_loss_epoch, correct_epoch, total_epoch = 0, 0, 0
@@ -2410,38 +1909,31 @@ class ZeroShotCompoundFaultDiagnosis:
                 optimizer.zero_grad()
 
                 with torch.no_grad():
-                    if inputs.dim() == 3 and inputs.shape[1] == 1:
-                        ae_inputs = inputs.squeeze(1)
-                    elif inputs.dim() == 2:
-                        ae_inputs = inputs
-                    else:
-
+                    ae_inputs = inputs.squeeze(1) if inputs.dim() == 3 and inputs.shape[1] == 1 else inputs
+                    if ae_inputs.dim() != 2 or ae_inputs.shape[1] != self.semantic_builder.autoencoder.input_length:
                         print(
-                            f"W: train_ae_data_semantic_cnn - Unexpected input shape for AE: {inputs.shape}. Skipping batch.")
+                            f"W: CNN train - AE input shape mismatch. Expected [B, {self.semantic_builder.autoencoder.input_length}], got {ae_inputs.shape}. Skipping batch.")
                         continue
+                    real_time_ae_semantics = self.semantic_builder.autoencoder.encode(ae_inputs)  # [B, ae_latent_dim]
 
-                    real_time_semantics = self.semantic_builder.autoencoder.encode(ae_inputs)
-                logits, _ = self.cnn_model(inputs, real_time_semantics)
+                logits = self.cnn_model(inputs, real_time_ae_semantics)
                 loss = criterion(logits, targets)
+
                 if torch.isnan(loss) or torch.isinf(loss):
                     print(f"W: CNN loss is NaN/Inf in train batch {batch_idx}. Skipping backward.")
                     continue
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.cnn_model.parameters(), max_norm=5.0)  # max_norm can be tuned
+                torch.nn.utils.clip_grad_norm_(self.cnn_model.parameters(), max_norm=5.0)
                 optimizer.step()
-                scheduler.step()
+                if scheduler: scheduler.step()
+
                 train_loss_epoch += loss.item() * inputs.size(0)
                 _, predicted = logits.max(1)
                 total_epoch += targets.size(0)
                 correct_epoch += predicted.eq(targets).sum().item()
-                if (batch_idx + 1) % 50 == 0 and total_epoch > 0:  # Log less frequently if needed
-                    current_lr = scheduler.get_last_lr()[0]
-                    print(f'Epoch {epoch + 1}/{epochs} | Batch {batch_idx + 1}/{len(train_loader)} | '
-                          f'LR: {current_lr:.6f} | Loss: {loss.item():.4f} | '
-                          f'Acc: {100. * predicted.eq(targets).sum().item() / targets.size(0):.2f}%')
-
             avg_train_loss = train_loss_epoch / total_epoch if total_epoch > 0 else 0
             avg_train_acc = 100. * correct_epoch / total_epoch if total_epoch > 0 else 0
+
             val_loss_epoch, val_correct_epoch, val_total_epoch = 0, 0, 0
             if val_loader:
                 self.cnn_model.eval()
@@ -2449,17 +1941,16 @@ class ZeroShotCompoundFaultDiagnosis:
                     for inputs_val, targets_val in val_loader:
                         inputs_val, targets_val = inputs_val.to(self.device), targets_val.to(self.device)
 
-                        if inputs_val.dim() == 3 and inputs_val.shape[1] == 1:
-                            ae_inputs_val = inputs_val.squeeze(1)
-                        elif inputs_val.dim() == 2:
-                            ae_inputs_val = inputs_val
-                        else:
+                        ae_inputs_val = inputs_val.squeeze(1) if inputs_val.dim() == 3 and inputs_val.shape[
+                            1] == 1 else inputs_val
+                        if ae_inputs_val.dim() != 2 or ae_inputs_val.shape[
+                            1] != self.semantic_builder.autoencoder.input_length:
                             print(
-                                f"W: train_ae_data_semantic_cnn - Unexpected input shape for AE in validation: {inputs_val.shape}. Skipping batch.")
+                                f"W: CNN val - AE input shape mismatch. Expected [B, {self.semantic_builder.autoencoder.input_length}], got {ae_inputs_val.shape}. Skipping batch.")
                             continue
+                        real_time_ae_semantics_val = self.semantic_builder.autoencoder.encode(ae_inputs_val)
 
-                        real_time_semantics_val = self.semantic_builder.autoencoder.encode(ae_inputs_val)
-                        logits_val, _ = self.cnn_model(inputs_val, real_time_semantics_val)
+                        logits_val = self.cnn_model(inputs_val, real_time_ae_semantics_val)
                         loss_val = criterion(logits_val, targets_val)
                         val_loss_epoch += loss_val.item() * inputs_val.size(0)
                         _, predicted_val = logits_val.max(1)
@@ -2469,1893 +1960,984 @@ class ZeroShotCompoundFaultDiagnosis:
                 avg_val_loss = val_loss_epoch / val_total_epoch if val_total_epoch > 0 else float('inf')
                 avg_val_acc = 100. * val_correct_epoch / val_total_epoch if val_total_epoch > 0 else 0
                 print(
-                    f'Epoch {epoch + 1}/{epochs} | Train Loss: {avg_train_loss:.4f} | Train Acc: {avg_train_acc:.2f}% | '
+                    f'CNN Epoch {epoch + 1}/{epochs} | Train Loss: {avg_train_loss:.4f} | Train Acc: {avg_train_acc:.2f}% | '
                     f'Val Loss: {avg_val_loss:.4f} | Val Acc: {avg_val_acc:.2f}%')
+
                 if avg_val_acc > best_val_acc:
                     best_val_acc = avg_val_acc
                     best_val_loss_at_best_acc = avg_val_loss
                     patience_counter = 0
                     torch.save(self.cnn_model.state_dict(), 'best_ae_semantic_cnn_realtime.pth')
-                    print(f"保存最佳模型 (实时语义)，验证集准确率: {avg_val_acc:.2f}%, 验证集损失: {avg_val_loss:.4f}")
-                elif avg_val_acc == best_val_acc:
-                    if avg_val_loss < best_val_loss_at_best_acc:
-                        best_val_loss_at_best_acc = avg_val_loss
-                        patience_counter = 0  # Reset patience as we found a better model (same acc, lower loss)
-                        torch.save(self.cnn_model.state_dict(), 'best_ae_semantic_cnn_realtime.pth')
-                        print(
-                            f"保存最佳模型 (实时语义)，验证集准确率: {avg_val_acc:.2f}%, 验证集损失: {avg_val_loss:.4f} (损失更优)")
-                    else:
-                        patience_counter += 1
-                else:  # avg_val_acc < best_val_acc
+                    print(
+                        f"保存最佳CNN模型 (实时语义)，验证集准确率: {avg_val_acc:.2f}%, 验证集损失: {avg_val_loss:.4f}")
+                elif avg_val_acc == best_val_acc and avg_val_loss < best_val_loss_at_best_acc:
+                    best_val_loss_at_best_acc = avg_val_loss
+                    patience_counter = 0
+                    torch.save(self.cnn_model.state_dict(), 'best_ae_semantic_cnn_realtime.pth')
+                    print(
+                        f"保存最佳CNN模型 (实时语义)，验证集准确率: {avg_val_acc:.2f}%, 验证集损失: {avg_val_loss:.4f} (损失更优)")
+                else:
                     patience_counter += 1
 
                 if patience_counter >= patience:
-                    print(f"早停: {patience}轮内未改善 (基于准确率优先，其次损失)")
+                    print(f"CNN训练早停: {patience}轮内未改善 (基于准确率优先，其次损失)")
                     break
-            else:
+            else:  # No validation loader
                 print(
-                    f'Epoch {epoch + 1}/{epochs} | Train Loss: {avg_train_loss:.4f} | Train Acc: {avg_train_acc:.2f}%')
-                # If no validation, save periodically or just the last model
-                if (epoch + 1) % 10 == 0 or epoch == epochs - 1:  # Save every 10 epochs or at the end
+                    f'CNN Epoch {epoch + 1}/{epochs} | Train Loss: {avg_train_loss:.4f} | Train Acc: {avg_train_acc:.2f}%')
+                if (epoch + 1) % 10 == 0 or epoch == epochs - 1:
                     torch.save(self.cnn_model.state_dict(), f'ae_semantic_cnn_realtime_epoch_{epoch + 1}.pth')
-                    print(f"模型已保存 (无验证集): epoch {epoch + 1}")
+                    print(f"CNN模型已保存 (无验证集): epoch {epoch + 1}")
 
         if os.path.exists('best_ae_semantic_cnn_realtime.pth'):
             self.cnn_model.load_state_dict(torch.load('best_ae_semantic_cnn_realtime.pth', map_location=self.device))
             print(
-                f"已加载最佳模型 (实时语义) - 最终验证准确率: {best_val_acc:.2f}%, 对应损失: {best_val_loss_at_best_acc:.4f}")
+                f"已加载最佳CNN模型 (实时语义) - 最终验证准确率: {best_val_acc:.2f}%, 对应损失: {best_val_loss_at_best_acc:.4f}")
         else:
-            print(
-                "警告: 未找到最佳模型文件 'best_ae_semantic_cnn_realtime.pth'。使用最后训练的模型 (如果无验证集，则为最后保存的模型)。")
+            print("警告: 未找到最佳CNN模型文件 'best_ae_semantic_cnn_realtime.pth'。使用最后训练的模型。")
 
+        self.cnn_model.eval()
         return self.cnn_model
 
-    def visualize_cnn_feature_distribution(self, data_dict, max_samples_per_class=200):
-        """
-        可视化双通道CNN模型提取的特征分布，包含单一故障和复合故障
-        """
-        # 准备数据：单一故障和复合故障
-        X_train, y_train = data_dict['X_train'], data_dict['y_train']
-        X_test,  y_test  = data_dict['X_test'],  data_dict['y_test']
-        single_idxs = [self.fault_types[k] for k in ['normal','inner','outer','ball']]
-        comp_idxs   = [self.fault_types[k] for k in self.compound_fault_types]
+    def train_semantic_autoencoder(self, data_dict, semantic_dict, epochs=SAE_EPOCHS, lr=SAE_LR, batch_size_sae=None):
+        print("\n--- 开始训练语义自编码器 (SAE) ---")
 
-        # 挑选样本
-        def sample_by_label(X, y, label_list):
-            samples, labels = [], []
-            for lbl in label_list:
-                idxs = np.where(y==lbl)[0]
-                if len(idxs)==0: continue
-                choose = np.random.choice(idxs, min(len(idxs), max_samples_per_class), replace=False)
-                samples.extend(X[choose])
-                labels.extend([lbl]*len(choose))
-            return np.array(samples), np.array(labels)
+        if batch_size_sae is None: batch_size_sae = self.batch_size
 
-        X_single, y_single = sample_by_label(X_train, y_train, single_idxs)
-        X_comp,   y_comp   = sample_by_label(X_test,  y_test,   comp_idxs)
-
-        # 合并
-        X_all = np.vstack([X_single, X_comp])
-        y_all = np.concatenate([y_single, y_comp])
-        names_all = [self.idx_to_fault[i] for i in y_all]
-
-        # 提取CNN特征
         self.cnn_model.eval()
         self.semantic_builder.autoencoder.eval()
-        features = []
-        batch_sz = 64
+        self.sae_model = SemanticAutoencoder(
+            feature_dim=self.cnn_feature_dim,
+            semantic_dim=self.fused_semantic_dim
+        ).to(self.device)
+        print(f"SAE 初始化: 输入维度 (CNN特征)={self.cnn_feature_dim}, 输出维度 (融合语义)={self.fused_semantic_dim}")
+
+        X_train_signals, y_train_labels = data_dict['X_train'], data_dict['y_train']
+        X_val_signals, y_val_labels = data_dict.get('X_val'), data_dict.get('y_val')
+
+        fused_semantics_map = semantic_dict.get('fused_semantics')
+        if not fused_semantics_map:
+            print("错误: SAE训练缺少融合语义 (fused_semantics)。")
+            return False
+        sae_train_cnn_features_list = []
+        sae_train_target_semantics_list = []
+        single_fault_indices = [self.fault_types[name] for name in self.single_fault_types_ordered]
+
+        temp_train_loader = DataLoader(
+            TensorDataset(torch.FloatTensor(X_train_signals), torch.LongTensor(y_train_labels)),
+            batch_size=batch_size_sae, shuffle=False)
+
         with torch.no_grad():
-            for i in range(0, len(X_all), batch_sz):
-                xbatch = torch.FloatTensor(X_all[i:i+batch_sz]).to(self.device)
-                # AE 语义
-                ae_in = xbatch.squeeze(1) if xbatch.ndim==3 else xbatch
-                sem = self.semantic_builder.autoencoder.encode(ae_in)
-                feat = self.cnn_model(xbatch, sem, return_features=True)
-                features.append(feat.cpu().numpy())
-        feats = np.vstack(features)
-
-        # 降维并绘图
-        configure_chinese_font()
-        # PCA 2D
-        pca = PCA(n_components=2)
-        pca2 = pca.fit_transform(feats)
-        plt.figure(figsize=(10,8))
-        palette = sns.color_palette('tab10', n_colors=len(set(names_all)))
-        sns.scatterplot(x=pca2[:,0], y=pca2[:,1], hue=names_all,
-                        palette=palette, s=50, alpha=0.7)
-        plt.title('CNN 特征空间 PCA 2D 投影')
-        plt.legend(loc='best', bbox_to_anchor=(1,1))
-        plt.tight_layout()
-        plt.savefig('cnn_feature_space_pca2d.png')
-        plt.close()
-
-        # t-SNE 2D
-        tsne = TSNE(n_components=2, perplexity=30, n_iter=1000, random_state=42)
-        tsne2 = tsne.fit_transform(feats)
-        plt.figure(figsize=(10,8))
-        sns.scatterplot(x=tsne2[:,0], y=tsne2[:,1], hue=names_all,
-                        palette=palette, s=50, alpha=0.7)
-        plt.title('CNN 特征空间 t-SNE 2D 投影')
-        plt.legend(loc='best', bbox_to_anchor=(1,1))
-        plt.tight_layout()
-        plt.savefig('cnn_feature_space_tsne2d.png')
-        plt.close()
-
-        # PCA 3D
-        pca3 = PCA(n_components=3)
-        pca3d = pca3.fit_transform(feats)
-        fig = plt.figure(figsize=(12,10))
-        ax = fig.add_subplot(111, projection='3d')
-        unique_names = list(sorted(set(names_all)))
-        color_map = {n: palette[i] for i,n in enumerate(unique_names)}
-        for name in unique_names:
-            mask = [nm==name for nm in names_all]
-            ax.scatter(pca3d[mask,0], pca3d[mask,1], pca3d[mask,2],
-                       c=[color_map[name]], label=name, s=40, alpha=0.7)
-        ax.set_title('CNN 特征空间 PCA 3D 投影')
-        ax.legend(loc='best', bbox_to_anchor=(1,1))
-        plt.tight_layout()
-        plt.savefig('cnn_feature_space_pca3d.png')
-        plt.close()
-
-        print("CNN 特征空间可视化完成，图像已保存：cnn_feature_space_pca2d.png, cnn_feature_space_tsne2d.png, cnn_feature_space_pca3d.png")
-
-    def run_pipeline(self):
-        """使用SAE的零样本复合故障诊断流水线"""
-        start_time = time.time()
-        accuracy_pca = 0.0
-        accuracy_cosine = 0.0
-        final_accuracy_to_report = 0.0
-
-        print("\n==== 步骤1: 数据加载 ====")
-        data_dict = self.load_data()
-        if data_dict is None:
-            raise RuntimeError("数据加载失败")
-
-        print("\n==== 步骤2: 语义构建 ====")
-        semantic_dict = self.build_semantics(data_dict)
-        if semantic_dict is None:
-            raise RuntimeError("语义构建失败")
-
-        self.actual_latent_dim = self.semantic_builder.actual_latent_dim  # 从AE获取真实的潜在维度
-
-        print("\n==== 步骤3: 初始化基于AE数据语义的双通道CNN模型 ====")
-        self.cnn_model = AEDataSemanticCNN(
-            input_length=self.sample_length,
-            semantic_dim=self.actual_latent_dim,
-            num_classes=self.num_classes,
-            feature_dim=CNN_FEATURE_DIM,
-            dropout_rate=getattr(self, 'cnn_dropout_rate', 0.3)
-        ).to(self.device)
-
-        self.cnn_feature_dim = CNN_FEATURE_DIM
-
-        print("\n==== 步骤4: 训练基于AE数据语义的双通道CNN模型 ====")
-        trained_cnn_model = self.train_ae_data_semantic_cnn(
-            data_dict=data_dict,
-            semantic_dict=semantic_dict,
-            epochs=CNN_EPOCHS,
-            batch_size=DEFAULT_BATCH_SIZE,
-            lr=CNN_LR
-        )
-
-        self.cnn_model = trained_cnn_model
-
-        print("\n==== 步骤5: 训练语义自动编码器(SAE) ====")
-        # 使用新的SAE训练方法替代原有的双向对齐方法
-        sae_train_success = self.train_semantic_autoencoder(
-            data_dict=data_dict,
-            semantic_dict=semantic_dict,
-            epochs=SEN_EPOCHS,
-            lr=SEN_LR
-        )
-
-        print("\n==== 步骤6: 生成复合故障投影 (使用SAE) ====")
-        compound_projections = self.generate_compound_fault_projections_sae(semantic_dict, data_dict)
-
-        print("\n==== 步骤7: 零样本学习评估 ====")
-        print("--- 评估方法1: PCA降维 + 欧氏距离 ---")
-        accuracy_pca, conf_matrix_pca = self.evaluate_zero_shot_with_pca(
-            data_dict,
-            compound_projections,
-            pca_components=3
-        )
-
-        print("\n--- 评估方法2: 原始特征空间 + 余弦相似度 ---")
-        accuracy_cosine, conf_matrix_cosine = self.evaluate_zero_shot_with_cosine_similarity(
-            data_dict,
-            compound_projections
-        )
-
-        print("\n==== 零样本学习评估 (t-SNE) ====")
-        accuracy_tsne, class_accs_tsne = self.evaluate_zero_shot_with_tsne(
-            data_dict,
-            compound_projections,
-            tsne_perplexity=min(30, len(data_dict['X_test']) - 1 if len(data_dict['X_test']) > 1 else 30),
-            tsne_n_iter=1000,
-            tsne_components=2
-        )
-
-        print(f"零样本学习准确率 (t-SNE方法): {accuracy_tsne:.2f}%")
-        final_accuracy_to_report = accuracy_pca
-
-        end_time = time.time()
-        print(f"\n=== SAE流水线在 {(end_time - start_time) / 60:.2f} 分钟内完成 ===")
-        print(f"零样本学习准确率 (PCA方法): {accuracy_pca:.2f}%")
-        print(f"零样本学习准确率 (余弦相似度方法): {accuracy_cosine:.2f}%")
-
-        self.visualize_cnn_feature_distribution(data_dict)
-        self.visualize_semantic_space(data_dict, semantic_dict)
-        projection_quality = self.visualize_unified_feature_space(
-            data_dict, semantic_dict, compound_projections, max_samples_per_class=200
-        )
-
-        return final_accuracy_to_report
-
-    def train_semantic_mapping_mlp_with_bidirectional_alignment(self, data_dict, semantic_dict,
-                                                                epochs=SEN_EPOCHS, lr=SEN_LR,
-                                                                mlp_hidden_dim1=512, mlp_hidden_dim2=256,
-                                                                mlp_dropout_rate=0.3):
-        """改进的双向对齐训练方法，增强特征对齐能力"""
-        print("\n--- 开始训练增强型双向对齐语义映射网络 ---")
-
-        self.cnn_model.eval()
-        self.embedding_net = BidirectionalSemanticNetwork(
-            semantic_dim=self.fused_semantic_dim,
-            feature_dim=self.cnn_model.feature_dim,
-            hidden_dim1=mlp_hidden_dim1,
-            hidden_dim2=mlp_hidden_dim2,
-            dropout_rate=mlp_dropout_rate
-        ).to(self.device)
-        print(f"增强型双向语义映射网络初始化:")
-        print(f"  语义维度: {self.fused_semantic_dim}")
-        print(f"  特征维度: {self.cnn_model.feature_dim}")
-
-        # 数据准备部分（与原方法相同）
-        X_train, y_train = data_dict['X_train'], data_dict['y_train']
-        X_val, y_val = data_dict.get('X_val'), data_dict.get('y_val')
-
-        fused_semantics = semantic_dict.get('fused_semantics', {})
-        data_semantics = {}
-        if 'data_prototypes' in semantic_dict:
-            data_semantics.update(semantic_dict['data_prototypes'])
-        if 'compound_data_semantics' in semantic_dict:
-            data_semantics.update(semantic_dict['compound_data_semantics'])
-
-        # 构建语义向量映射（与原方法相同）
-        semantic_vectors_map = {}  # 融合语义 - 用于MLP训练
-        data_semantic_vectors_map = {}  # 数据语义 - 用于CNN特征提取
-
-        for fault_name, semantic_vec in fused_semantics.items():
-            if fault_name in self.fault_types and np.all(np.isfinite(semantic_vec)):
-                fault_idx = self.fault_types[fault_name]
-                semantic_vectors_map[fault_idx] = semantic_vec
-
-        for fault_name, semantic_vec in data_semantics.items():
-            if fault_name in self.fault_types and np.all(np.isfinite(semantic_vec)):
-                fault_idx = self.fault_types[fault_name]
-                data_semantic_vectors_map[fault_idx] = semantic_vec
-
-        # 数据加载器设置（与原方法相同）
-        train_dataset = TensorDataset(torch.FloatTensor(X_train), torch.LongTensor(y_train))
-        mlp_batch_size = getattr(self, 'batch_size', DEFAULT_BATCH_SIZE)
-        train_loader = DataLoader(train_dataset, batch_size=mlp_batch_size, shuffle=True, drop_last=True)
-
-        val_loader = None
-        if X_val is not None and y_val is not None and len(X_val) > 0:
-            val_dataset = TensorDataset(torch.FloatTensor(X_val), torch.LongTensor(y_val))
-            val_loader = DataLoader(val_dataset, batch_size=mlp_batch_size, shuffle=False)
-
-        # 改进的优化器设置 - 使用更高级的优化器配置
-        optimizer = optim.AdamW(self.embedding_net.parameters(), lr=lr, weight_decay=2e-5)
-
-        # 多阶段学习率调度 - 先快速学习，再精细调整
-        def create_scheduler(optimizer):
-            # 先快速预热，再余弦退火
-            return optim.lr_scheduler.OneCycleLR(
-                optimizer, max_lr=lr * 1.5,
-                steps_per_epoch=len(train_loader),
-                epochs=epochs,
-                pct_start=0.1,  # 快速预热
-                div_factor=25,  # 初始学习率 = max_lr/div_factor
-                final_div_factor=1000,  # 最终学习率 = max_lr/(div_factor*final_div_factor)
-                anneal_strategy='cos'
-            )
-
-        scheduler = create_scheduler(optimizer)
-        # 多种损失函数
-        mse_loss_fn = nn.MSELoss()
-        cosine_loss_fn = nn.CosineEmbeddingLoss()
-        l1_loss_fn = nn.L1Loss()
-
-        # 增强版对比损失
-        def enhanced_contrastive_loss(features, labels, temperature=0.07):
-            """增强版对比损失，更强的类内聚集和类间分离"""
-            batch_size = features.size(0)
-            if batch_size <= 1:
-                return torch.tensor(0.0, device=features.device)
-
-            # 特征归一化
-            features_norm = F.normalize(features, dim=1)
-
-            # 计算余弦相似度矩阵
-            similarity_matrix = torch.matmul(features_norm, features_norm.T) / temperature
-
-            # 掩码：同类为1，异类为0
-            labels = labels.view(-1, 1)
-            mask = torch.eq(labels, labels.T).float()
-
-            # 移除对角线
-            mask = mask - torch.eye(batch_size, device=features.device)
-
-            # 对于正样本对
-            positive_mask = mask.bool()
-            positive_similarity = similarity_matrix[positive_mask]
-
-            # 对于负样本对 - 使用硬负样本挖掘
-            negative_mask = (~mask.bool()) & (similarity_matrix > 0)  # 只关注有较高相似度的负样本
-            negative_similarity = similarity_matrix[negative_mask]
-
-            # 归一化正样本和负样本损失
-            pos_loss = -torch.mean(positive_similarity) if len(positive_similarity) > 0 else torch.tensor(0.0,
-                                                                                                          device=features.device)
-            neg_loss = torch.mean(torch.clamp(negative_similarity, min=0)) if len(
-                negative_similarity) > 0 else torch.tensor(0.0, device=features.device)
-
-            return pos_loss + neg_loss
-
-        # 投影对齐损失 - 专门针对每个类别计算特征对齐
-        def projection_alignment_loss(pred_features, target_features, labels):
-            """计算每个类别内的特征对齐损失"""
-            unique_labels = torch.unique(labels)
-            alignment_loss = 0.0
-
-            for lbl in unique_labels:
-                mask = (labels == lbl)
-                if torch.sum(mask) <= 1:  # 需要至少两个样本
+            for signals_batch, labels_batch in temp_train_loader:
+                signals_batch = signals_batch.to(self.device)
+                ae_input_for_cnn = signals_batch.squeeze(1) if signals_batch.dim() == 3 and signals_batch.shape[
+                    1] == 1 else signals_batch
+                if ae_input_for_cnn.dim() != 2 or ae_input_for_cnn.shape[
+                    1] != self.semantic_builder.autoencoder.input_length:
                     continue
+                current_ae_semantics = self.semantic_builder.autoencoder.encode(ae_input_for_cnn)
 
-                class_pred = pred_features[mask]
-                class_target = target_features[mask]
+                cnn_features_batch = self.cnn_model(signals_batch, current_ae_semantics, return_features=True)
 
-                # 同时考虑距离和方向
-                mse = F.mse_loss(class_pred, class_target)
-
-                # 计算中心点偏移
-                pred_center = torch.mean(class_pred, dim=0)
-                target_center = torch.mean(class_target, dim=0)
-                center_shift = F.mse_loss(pred_center, target_center)
-
-                # 计算方向一致性
-                class_pred_norm = F.normalize(class_pred, dim=1)
-                class_target_norm = F.normalize(class_target, dim=1)
-                direction_sim = 1.0 - torch.mean(torch.sum(class_pred_norm * class_target_norm, dim=1))
-
-                # 给复合故障更高的权重
-                is_compound = '_' in self.idx_to_fault.get(lbl.item(), '')
-                weight = 2.0 if is_compound else 1.0
-
-                alignment_loss += weight * (mse + center_shift * 2.0 + direction_sim)
-
-            return alignment_loss / (len(unique_labels) + 1e-8)
-
-        # 训练循环
-        best_val_loss = float('inf')
-        patience_epochs = 30  # 更长的耐心值
-        current_patience = 0
-
-        # 针对性设置故障类型名称字典
-        label_to_fault_name = {idx: name for name, idx in self.fault_types.items()}
-
-        # 记录投影特征质量评估
-        projection_quality = {
-            'inner_outer': [],
-            'inner_ball': [],
-            'outer_ball': [],
-            'inner_outer_ball': [],
-        }
-
-        # 训练循环
-        for epoch in range(epochs):
-            self.embedding_net.train()
-            epoch_losses = {
-                'forward': 0.0, 'reverse': 0.0, 'cycle': 0.0,
-                'contrastive': 0.0, 'projection': 0.0, 'total': 0.0
-            }
-            num_valid_batches = 0
-
-            for batch_idx, (batch_signals, batch_labels) in enumerate(train_loader):
-                batch_signals = batch_signals.to(self.device)
-                batch_labels = batch_labels.to(self.device)
-
-                # 准备双种语义向量与故障类型名称
-                batch_semantic_inputs_list = []  # 融合语义用于MLP
-                batch_data_semantic_list = []  # 数据语义用于CNN
-                valid_indices = []
-                valid_labels = []
-                fault_types = []  # 故障类型名称列表
-
-                for i, label_idx in enumerate(batch_labels):
+                for i, label_idx in enumerate(labels_batch):
                     label_item = label_idx.item()
-                    fused_sem = semantic_vectors_map.get(label_item)
-                    data_sem = data_semantic_vectors_map.get(label_item)
+                    if label_item in single_fault_indices:
+                        fault_name = self.idx_to_fault.get(label_item)
+                        target_fused_semantic = fused_semantics_map.get(fault_name)
+                        if target_fused_semantic is not None and np.all(np.isfinite(target_fused_semantic)):
+                            sae_train_cnn_features_list.append(cnn_features_batch[i].cpu().numpy())
+                            sae_train_target_semantics_list.append(target_fused_semantic)
 
-                    if fused_sem is not None and data_sem is not None:
-                        batch_semantic_inputs_list.append(fused_sem)
-                        batch_data_semantic_list.append(data_sem)
-                        valid_indices.append(i)
-                        valid_labels.append(label_item)
-                        # 获取故障类型名称
-                        fault_types.append(label_to_fault_name.get(label_item, "unknown"))
 
-                if len(valid_indices) <= 1:
+        X_sae_train = torch.FloatTensor(np.array(sae_train_cnn_features_list)).to(self.device)
+        A_sae_train = torch.FloatTensor(np.array(sae_train_target_semantics_list)).to(self.device)
+
+        sae_train_dataset = TensorDataset(X_sae_train, A_sae_train)
+        sae_train_loader = DataLoader(sae_train_dataset, batch_size=batch_size_sae, shuffle=True, drop_last=True)
+
+        sae_val_loader = None
+        if X_val_signals is not None and y_val_labels is not None and len(X_val_signals) > 0:
+            sae_val_cnn_features_list = []
+            sae_val_target_semantics_list = []
+            temp_val_loader = DataLoader(
+                TensorDataset(torch.FloatTensor(X_val_signals), torch.LongTensor(y_val_labels)),
+                batch_size=batch_size_sae, shuffle=False)
+            with torch.no_grad():
+                for signals_batch_val, labels_batch_val in temp_val_loader:
+                    signals_batch_val = signals_batch_val.to(self.device)
+                    ae_input_val = signals_batch_val.squeeze(1) if signals_batch_val.dim() == 3 and \
+                                                                   signals_batch_val.shape[
+                                                                       1] == 1 else signals_batch_val
+                    if ae_input_val.dim() != 2 or ae_input_val.shape[
+                        1] != self.semantic_builder.autoencoder.input_length:
+                        continue
+                    current_ae_semantics_val = self.semantic_builder.autoencoder.encode(ae_input_val)
+                    cnn_features_batch_val = self.cnn_model(signals_batch_val, current_ae_semantics_val,
+                                                            return_features=True)
+
+                    for i, label_idx_val in enumerate(labels_batch_val):
+                        label_item_val = label_idx_val.item()
+                        if label_item_val in single_fault_indices:
+                            fault_name_val = self.idx_to_fault.get(label_item_val)
+                            target_fused_semantic_val = fused_semantics_map.get(fault_name_val)
+                            if target_fused_semantic_val is not None and np.all(np.isfinite(target_fused_semantic_val)):
+                                sae_val_cnn_features_list.append(cnn_features_batch_val[i].cpu().numpy())
+                                sae_val_target_semantics_list.append(target_fused_semantic_val)
+            if sae_val_cnn_features_list:
+                X_sae_val = torch.FloatTensor(np.array(sae_val_cnn_features_list)).to(self.device)
+                A_sae_val = torch.FloatTensor(np.array(sae_val_target_semantics_list)).to(self.device)
+                sae_val_dataset = TensorDataset(X_sae_val, A_sae_val)
+                sae_val_loader = DataLoader(sae_val_dataset, batch_size=batch_size_sae, shuffle=False)
+
+        optimizer = optim.AdamW(self.sae_model.parameters(), lr=lr, weight_decay=1e-5)
+        mse_loss_fn = nn.MSELoss()
+        sae_scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=10, factor=0.5, verbose=True)
+
+        best_sae_val_loss = float('inf')
+        sae_patience_epochs = 20
+        sae_current_patience = 0
+
+        for epoch in range(epochs):
+            self.sae_model.train()
+            epoch_total_loss, epoch_recon_loss, epoch_proj_loss = 0, 0, 0
+            num_batches = 0
+            for x_s_batch, a_s_batch in sae_train_loader:
+                optimizer.zero_grad()
+                a_pred_batch = self.sae_model(x_s_batch)
+                x_recon_batch = self.sae_model.reconstruct_features(a_s_batch)
+
+                loss1_feature_recon = mse_loss_fn(x_recon_batch, x_s_batch)
+                loss2_semantic_proj = mse_loss_fn(a_pred_batch, a_s_batch)
+
+                total_loss = loss1_feature_recon + self.sae_mu * loss2_semantic_proj
+
+                if torch.isnan(total_loss) or torch.isinf(total_loss):
+                    print(f"W: SAE loss NaN/Inf at epoch {epoch + 1}. Skipping batch.")
                     continue
 
-                batch_semantic_inputs = torch.FloatTensor(np.array(batch_semantic_inputs_list)).to(self.device)
-                batch_data_semantics = torch.FloatTensor(np.array(batch_data_semantic_list)).to(self.device)
-                batch_signals_filtered = batch_signals[valid_indices]
-                valid_labels_tensor = torch.LongTensor(valid_labels).to(self.device)
+                total_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.sae_model.parameters(), 1.0)
+                optimizer.step()
 
-                # 获取CNN真实特征
+                epoch_total_loss += total_loss.item()
+                epoch_recon_loss += loss1_feature_recon.item()
+                epoch_proj_loss += loss2_semantic_proj.item()
+                num_batches += 1
+
+            avg_epoch_loss = epoch_total_loss / num_batches if num_batches > 0 else 0
+            avg_recon_loss = epoch_recon_loss / num_batches if num_batches > 0 else 0
+            avg_proj_loss = epoch_proj_loss / num_batches if num_batches > 0 else 0
+
+            current_sae_lr = optimizer.param_groups[0]['lr']
+            print(
+                f"SAE Epoch [{epoch + 1}/{epochs}] LR: {current_sae_lr:.7f} | Total Loss: {avg_epoch_loss:.4f} | FeatRecon: {avg_recon_loss:.4f} | SemProj: {avg_proj_loss:.4f}")
+
+            if sae_val_loader:
+                self.sae_model.eval()
+                val_total_loss, val_recon_loss, val_proj_loss = 0, 0, 0
+                num_val_batches = 0
                 with torch.no_grad():
-                    if batch_signals_filtered.dim() == 3 and batch_signals_filtered.shape[1] == 1:
-                        ae_batch_signals_filtered = batch_signals_filtered.squeeze(1)
-                    elif batch_signals_filtered.dim() == 2:
-                        ae_batch_signals_filtered = batch_signals_filtered
-                    else:
-                        print(f"W: Unexpected shape for AE input in MLP training: {batch_signals_filtered.shape}")
+                    for x_s_val_batch, a_s_val_batch in sae_val_loader:
+                        a_pred_val_batch = self.sae_model(x_s_val_batch)
+                        x_recon_val_batch = self.sae_model.reconstruct_features(a_s_val_batch)
 
-                        continue
+                        val_loss1 = mse_loss_fn(x_recon_val_batch, x_s_val_batch)
+                        val_loss2 = mse_loss_fn(a_pred_val_batch, a_s_val_batch)
+                        batch_val_loss = val_loss1 + self.sae_mu * val_loss2
 
-                    real_time_ae_semantics_for_cnn = self.semantic_builder.autoencoder.encode(ae_batch_signals_filtered)
+                        if not torch.isnan(batch_val_loss):
+                            val_total_loss += batch_val_loss.item()
+                            val_recon_loss += val_loss1.item()
+                            val_proj_loss += val_loss2.item()
+                            num_val_batches += 1
 
-                    target_features = self.cnn_model(
-                        batch_signals_filtered,  # 原始信号给CNN的信号编码器
-                        semantic=real_time_ae_semantics_for_cnn,  # 实时AE语义给CNN的语义编码器
-                        return_features=True
-                    )
-                optimizer.zero_grad()
+                avg_val_total_loss = val_total_loss / num_val_batches if num_val_batches > 0 else float('inf')
+                avg_val_recon_loss = val_recon_loss / num_val_batches if num_val_batches > 0 else float('inf')
+                avg_val_proj_loss = val_proj_loss / num_val_batches if num_val_batches > 0 else float('inf')
 
-                pred_features = []
-                for i, semantic in enumerate(batch_semantic_inputs):
-                    # 分别处理每个样本，提供故障类型信息
-                    feature = self.embedding_net(
-                        semantic.unsqueeze(0),
-                        mode='forward',
-                        fault_type=fault_types[i]
-                    )
-                    pred_features.append(feature)
-                pred_features = torch.cat(pred_features, dim=0)
+                print(
+                    f"  SAE Val Loss: {avg_val_total_loss:.4f} | Val FeatRecon: {avg_val_recon_loss:.4f} | Val SemProj: {avg_val_proj_loss:.4f}")
 
-                # 2. 反向映射
-                pred_semantics = self.embedding_net(target_features, mode='reverse')
+                sae_scheduler.step(avg_val_total_loss)  # Step scheduler with validation loss
 
-                # 3. 循环一致性
-                cycle_features = []
-                cycle_semantics = []
-                for i, semantic in enumerate(batch_semantic_inputs):
-                    feature, reconstructed = self.embedding_net(
-                        semantic.unsqueeze(0),
-                        mode='cycle',
-                        fault_type=fault_types[i]
-                    )
-                    cycle_features.append(feature)
-                    cycle_semantics.append(reconstructed)
-                cycle_features = torch.cat(cycle_features, dim=0)
-                cycle_semantics = torch.cat(cycle_semantics, dim=0)
-
-                # --- 计算多种损失 ---
-                # 1. 基础映射损失
-                forward_loss = mse_loss_fn(pred_features, target_features) + \
-                               l1_loss_fn(pred_features, target_features) * 0.5
-
-                reverse_loss = mse_loss_fn(pred_semantics, batch_semantic_inputs)
-
-                cycle_loss = mse_loss_fn(cycle_semantics, batch_semantic_inputs)
-
-                # 2. 特征对齐损失 - 类内对齐和方向一致性
-                projection_loss = projection_alignment_loss(
-                    pred_features, target_features, valid_labels_tensor
-                )
-
-                # 3. 对比损失 - 基于类别的对比学习
-                contrastive_loss = enhanced_contrastive_loss(
-                    pred_features, valid_labels_tensor, temperature=0.07
-                )
-
-                # 4. 复合故障特殊处理 - 针对性强化outer_ball和inner_outer_ball
-                compound_loss = 0.0
-                compound_count = 0
-                for i, fault_type in enumerate(fault_types):
-                    # 特别关注这两个问题故障类型
-                    if fault_type in ['outer_ball', 'inner_outer_ball']:
-                        feat_pred = pred_features[i].unsqueeze(0)
-                        feat_target = target_features[i].unsqueeze(0)
-
-                        # 特殊增强损失 - 同时惩罚方向和距离
-                        comp_l2 = F.mse_loss(feat_pred, feat_target) * 2.0
-
-                        # 方向一致性
-                        feat_pred_norm = F.normalize(feat_pred, dim=1)
-                        feat_target_norm = F.normalize(feat_target, dim=1)
-                        comp_dir = 1.0 - torch.sum(feat_pred_norm * feat_target_norm)
-
-                        compound_loss += comp_l2 + comp_dir * 2.0
-                        compound_count += 1
-
-                if compound_count > 0:
-                    compound_loss /= compound_count
-
-                # --- 动态权重策略 ---
-                epoch_progress = epoch / epochs  # 训练进度比例
-
-                # 随着训练进行，增加特殊类型损失的权重
-                w_forward = 1.5
-                w_reverse = 1.0
-                w_cycle = 0.5
-                w_contrastive = 0.4 + 0.6 * epoch_progress
-                w_projection = 0.8 + 1.2 * epoch_progress
-                w_compound = 1.0 + 5.0 * epoch_progress  # 大幅增加复合故障权重
-
-                # 总损失
-                total_loss = (
-                        w_forward * forward_loss +
-                        w_reverse * reverse_loss +
-                        w_cycle * cycle_loss +
-                        w_contrastive * contrastive_loss +
-                        w_projection * projection_loss
-                )
-
-                # 只有在有复合故障样本时才添加复合损失
-                if compound_count > 0:
-                    total_loss += w_compound * compound_loss
-
-                # 反向传播
-                if torch.isfinite(total_loss):
-                    total_loss.backward()
-                    # 梯度裁剪
-                    torch.nn.utils.clip_grad_norm_(self.embedding_net.parameters(), max_norm=1.0)
-                    optimizer.step()
-                    scheduler.step()
-
-                    epoch_losses['forward'] += forward_loss.item()
-                    epoch_losses['reverse'] += reverse_loss.item()
-                    epoch_losses['cycle'] += cycle_loss.item()
-                    epoch_losses['contrastive'] += contrastive_loss.item()
-                    epoch_losses['projection'] += projection_loss.item()
-                    epoch_losses['total'] += total_loss.item()
-                    num_valid_batches += 1
-
-                    # 记录特定故障类型的投影质量
-                    with torch.no_grad():
-                        for i, fault_type in enumerate(fault_types):
-                            if fault_type in projection_quality:
-                                pred = pred_features[i].detach()
-                                target = target_features[i].detach()
-                                quality = 1.0 - F.cosine_similarity(pred.unsqueeze(0), target.unsqueeze(0)).item()
-                                projection_quality[fault_type].append(quality)
+                if avg_val_total_loss < best_sae_val_loss:
+                    best_sae_val_loss = avg_val_total_loss
+                    torch.save(self.sae_model.state_dict(), 'best_semantic_autoencoder.pth')
+                    print(f"  New best SAE model saved (Val Loss: {best_sae_val_loss:.4f})")
+                    sae_current_patience = 0
                 else:
-                    print(f"警告: 批次 {batch_idx} 损失非有限值，跳过此批次的更新。")
+                    sae_current_patience += 1
+                    if sae_current_patience >= sae_patience_epochs:
+                        print(f"SAE training early stopping at epoch {epoch + 1}.")
+                        break
+            else:  # No validation
+                if (epoch + 1) % 10 == 0 or epoch == epochs - 1:
+                    torch.save(self.sae_model.state_dict(), f'semantic_autoencoder_epoch_{epoch + 1}.pth')
+                    print(f"  SAE model saved (Epoch {epoch + 1}, no validation)")
 
-            # 计算并打印损失
-            if num_valid_batches > 0:
-                for k in epoch_losses:
-                    epoch_losses[k] /= num_valid_batches
+        if os.path.exists('best_semantic_autoencoder.pth'):
+            self.sae_model.load_state_dict(torch.load('best_semantic_autoencoder.pth', map_location=self.device))
+            print("Best SAE model loaded.")
+        else:
+            print("Warning: No best SAE model found. Using last trained model (if any).")
 
-                print(f"Epoch [{epoch + 1}/{epochs}] - LR: {scheduler.get_last_lr()[0]:.6f}")
-                print(f"  正向映射损失: {epoch_losses['forward']:.4f}")
-                print(f"  反向映射损失: {epoch_losses['reverse']:.4f}")
-                print(f"  循环一致性损失: {epoch_losses['cycle']:.4f}")
-                print(f"  对比损失: {epoch_losses['contrastive']:.4f}")
-                print(f"  投影对齐损失: {epoch_losses['projection']:.4f}")
-                print(f"  总损失: {epoch_losses['total']:.4f}")
-
-                # 打印平均投影质量
-                print("  故障类型投影质量 (越低越好):")
-                for fault_type, quality_list in projection_quality.items():
-                    if quality_list:
-                        avg_quality = sum(quality_list[-50:]) / min(len(quality_list), 50) if quality_list else 0
-                        print(f"    - {fault_type}: {avg_quality:.4f}")
-
-                # 清空质量记录器，避免内存占用过大
-                for k in projection_quality:
-                    projection_quality[k] = projection_quality[k][-100:] if projection_quality[k] else []
-            else:
-                print(f"Epoch [{epoch + 1}/{epochs}] - 无有效批次")
-                continue
-
-            if val_loader:
-
-                self.embedding_net.eval()
-                val_total_loss = 0.0
-                val_batches = 0
-
-                with torch.no_grad():
-                    for batch_signals_val, batch_labels_val in val_loader:
-                        batch_signals_val = batch_signals_val.to(self.device)
-                        batch_labels_val = batch_labels_val.to(self.device)
-
-                        # 准备双种语义向量
-                        batch_semantic_val_list = []  # 融合语义用于MLP
-                        batch_data_semantic_val_list = []  # 数据语义用于CNN
-                        valid_indices_val = []
-
-                        for i, label_idx in enumerate(batch_labels_val):
-                            label_item = label_idx.item()
-                            fused_sem = semantic_vectors_map.get(label_item)
-                            data_sem = data_semantic_vectors_map.get(label_item)
-
-                            if fused_sem is not None and data_sem is not None:
-                                batch_semantic_val_list.append(fused_sem)
-                                batch_data_semantic_val_list.append(data_sem)
-                                valid_indices_val.append(i)
-
-                        if not valid_indices_val:
-                            continue
-
-                        batch_semantic_val = torch.FloatTensor(np.array(batch_semantic_val_list)).to(self.device)
-                        batch_data_semantic_val = torch.FloatTensor(np.array(batch_data_semantic_val_list)).to(
-                            self.device)
-                        batch_signals_val_filtered = batch_signals_val[valid_indices_val]
-
-                        # 获取验证集的真实特征 - 使用数据语义
-                        target_features_val = self.cnn_model(
-                            batch_signals_val_filtered,
-                            semantic=batch_data_semantic_val,
-                            return_features=True
-                        )
-
-                        # 验证正向映射
-                        pred_features_val = self.embedding_net(batch_semantic_val, mode='forward')
-
-                        # 验证反向映射
-                        pred_semantics_val = self.embedding_net(target_features_val, mode='reverse')
-
-                        # 验证循环一致性
-                        _, reconstructed_semantics_val = self.embedding_net(batch_semantic_val, mode='cycle')
-
-                        # 计算验证损失
-                        val_forward_loss = mse_loss_fn(pred_features_val, target_features_val)
-                        val_reverse_loss = mse_loss_fn(pred_semantics_val, batch_semantic_val)
-                        val_cycle_loss = mse_loss_fn(reconstructed_semantics_val, batch_semantic_val)
-
-                        # 验证总损失 (使用相同权重)
-                        val_batch_loss = (w_forward * val_forward_loss +
-                                          w_reverse * val_reverse_loss +
-                                          w_cycle * val_cycle_loss)
-
-                        if torch.isfinite(val_batch_loss):
-                            val_total_loss += val_batch_loss.item()
-                            val_batches += 1
-
-                    if val_batches > 0:
-                        avg_val_loss = val_total_loss / val_batches
-                        print(f"  验证集损失: {avg_val_loss:.4f}")
-
-                        # 学习率调度
-                        scheduler.step(avg_val_loss)
-
-                        # 保存最佳模型
-                        if avg_val_loss < best_val_loss:
-                            best_val_loss = avg_val_loss
-                            torch.save(self.embedding_net.state_dict(), 'best_bidirectional_semantic_network.pth')
-                            print(f"  新的最佳模型已保存 (验证损失: {best_val_loss:.4f})")
-                            current_patience = 0
-                        else:
-                            current_patience += 1
-                            if current_patience >= patience_epochs:
-                                print(f"早停：验证损失在 {patience_epochs} 轮内未改善。")
-                                break
-            else:  # 如果没有验证集
-                if (epoch + 1) % 10 == 0:  # 每10轮保存一次
-                    torch.save(self.embedding_net.state_dict(), f'bidirectional_semantic_network_epoch_{epoch + 1}.pth')
-                    print(f"  模型已保存 (Epoch {epoch + 1})")
-
-                # 训练结束，加载最佳模型
-        if val_loader and os.path.exists('best_bidirectional_semantic_network.pth'):
-            self.embedding_net.load_state_dict(torch.load('best_bidirectional_semantic_network.pth'))
-            print("已加载最佳双向语义映射网络模型")
-
-        print("双向对齐语义映射网络训练完成!")
+        self.sae_model.eval()
         return True
 
-    def generate_compound_fault_projections_fixed(self, semantic_dict, data_dict):
+    def get_target_compound_semantics_for_eval(self, semantic_dict):
         """
-        生成复合故障投影，严格遵循零样本原则：不使用任何复合故障数据
+        Retrieves the target fused semantic vectors for compound faults.
+        This replaces the old 'generate_compound_fault_projections_fixed' as SAE projects features to semantics.
+        The "projections" for ZSL evaluation are now these target semantic vectors themselves.
         """
-        print("\n生成复合故障投影...")
-
-
+        print("\n获取复合故障的目标融合语义用于评估...")
         fused_semantics = semantic_dict.get('fused_semantics')
 
-        reference_centroids = None
-
-        # 提取所有复合故障的语义向量
-        compound_fault_types = self.compound_fault_types
-        print(f"准备为以下{len(compound_fault_types)}种复合故障生成投影: {compound_fault_types}")
-
-        compound_fused_semantics = {}
-        for fault_type in compound_fault_types:
+        target_compound_semantics = {}
+        for fault_type in self.compound_fault_types:
             if fault_type in fused_semantics:
                 sem_vec = fused_semantics[fault_type]
-                if sem_vec is not None and np.all(np.isfinite(sem_vec)):
-                    compound_fused_semantics[fault_type] = sem_vec
-                else:
-                    print(f"警告: '{fault_type}'的语义向量包含无效值，尝试修复...")
-                    # 尝试从其组成部分重新合成语义
-                    fixed_vec = self._regenerate_compound_semantic(fault_type, fused_semantics)
-                    if fixed_vec is not None:
-                        compound_fused_semantics[fault_type] = fixed_vec
-                        print(f"  - 成功重新合成'{fault_type}'的语义向量")
-                    else:
-                        print(f"  - 无法修复'{fault_type}'的语义向量，跳过")
-
-
-        print(f"成功获取{len(compound_fused_semantics)}种复合故障的语义向量")
-
-        # 使用语义嵌入网络生成投影
-        self.embedding_net.eval()
-
-        # 初始化结果字典
-        compound_projections = {}
-        failed_projections = []
-
-        # 投影每个复合故障
-        with torch.no_grad():
-            for fault_type, semantic_vec in compound_fused_semantics.items():
-                # 创建语义向量的多个副本进行冗余投影以提高稳定性
-                projection_attempts = []
-                num_attempts = 5  # 多次尝试以提高稳定性
-
-                for attempt in range(num_attempts):
-                    # 每次尝试添加少量噪声以获得更多样的投影结果
-                    noise_scale = 0.01 * attempt  # 逐渐增加噪声
-                    noised_vec = semantic_vec.copy()
-                    if attempt > 0:  # 第一次使用原始向量
-                        noised_vec += np.random.normal(0, noise_scale, size=len(semantic_vec))
-
-                    # 检查向量的有效性
-                    if not np.all(np.isfinite(noised_vec)):
-                        continue
-
-                    # 转换为张量
-                    semantic_tensor = torch.FloatTensor(noised_vec).unsqueeze(0).to(self.device)
-
-                    # 通过SEN投影
-                    projected_feature = self.embedding_net(semantic_tensor, mode='forward', fault_type=fault_type)
-
-                    # 验证投影的有效性
-                    if torch.all(torch.isfinite(projected_feature)):
-                        projection_attempts.append(projected_feature.cpu().numpy().squeeze(0))
-
-                # 汇总多次投影结果
-                if projection_attempts:
-                    # 计算有效投影的均值作为最终结果
-                    final_projection = np.mean(projection_attempts, axis=0)
-                    compound_projections[fault_type] = final_projection
-                    print(f"  - '{fault_type}'投影成功 ({len(projection_attempts)}/{num_attempts}次尝试有效)")
-                else:
-                    failed_projections.append(fault_type)
-                    print(f"  - 无法为'{fault_type}'生成有效投影")
-
-        # 尝试为失败的投影通过组分平均生成
-        if failed_projections:
-            print("尝试通过组分平均为失败的投影生成替代方案...")
-            for fault_type in failed_projections:
-                # 分解复合故障名称，获取组成部分
-                components = fault_type.split('_')
-                component_projections = []
-
-                # 收集单一故障的投影
-                for single_fault_type in self.single_fault_types_ordered:
-                    if single_fault_type in components:
-                        # 使用单一故障的语义生成投影
-                        if single_fault_type in fused_semantics:
-                            single_sem = fused_semantics[single_fault_type]
-                            if np.all(np.isfinite(single_sem)):
-                                try:
-                                    single_tensor = torch.FloatTensor(single_sem).unsqueeze(0).to(self.device)
-                                    single_proj = self.embedding_net(single_tensor, mode='forward',
-                                                                     fault_type=single_fault_type)
-                                    if torch.all(torch.isfinite(single_proj)):
-                                        component_projections.append(single_proj.cpu().numpy().squeeze(0))
-                                except Exception as e:
-                                    print(f"警告: 无法为组分'{single_fault_type}'生成投影: {e}")
-
-                # 如果找到了足够的组分投影，计算它们的平均值
-                if len(component_projections) >= 2:  # 至少需要两个组分
-                    avg_proj = np.mean(component_projections, axis=0)
-                    if np.all(np.isfinite(avg_proj)):
-                        compound_projections[fault_type] = avg_proj
-                        print(f"  - 使用组分平均成功生成'{fault_type}'的投影")
-
-        # 确认生成的投影数量
-        if len(compound_projections) == 0:
-            print("错误: 无有效的复合故障投影生成")
-            return None
-
-        print(f"成功生成{len(compound_projections)}种复合故障投影")
-
-        # 打印相似度矩阵 (用于调试)
-        if len(compound_projections) > 1:
-            print("\n投影相似度矩阵:")
-            fault_types = list(compound_projections.keys())
-            for i in range(len(fault_types)):
-                for j in range(i + 1, len(fault_types)):
-                    v1 = compound_projections[fault_types[i]]
-                    v2 = compound_projections[fault_types[j]]
-                    v1_norm = v1 / np.linalg.norm(v1)
-                    v2_norm = v2 / np.linalg.norm(v2)
-                    sim = np.dot(v1_norm, v2_norm)
-                    print(f"  {fault_types[i]} vs {fault_types[j]}: {sim:.4f}")
-
-        return compound_projections
-
-    def _regenerate_compound_semantic(self, fault_type, fused_semantics):
-        """
-        如果复合故障的语义有问题，尝试从组成部分重新生成
-        """
-        components = fault_type.split('_')
-        if len(components) <= 1:
-            return None  # 不是复合故障
-
-        # 收集有效的组件语义
-        component_semantics = []
-        for comp in components:
-            if comp in fused_semantics and np.all(np.isfinite(fused_semantics[comp])):
-                component_semantics.append(fused_semantics[comp])
-
-        if not component_semantics:
-            return None  # 没有有效的组件语义
-
-        if len(component_semantics) == 1:
-            return component_semantics[0]  # 只有一个有效组件
-
-        # 简单平均组合 - 比复杂的张量融合更稳定
-        combined = np.mean(component_semantics, axis=0)
-
-        # 确保结果有效
-        if np.all(np.isfinite(combined)):
-            return combined
-        return None
-
-    def evaluate_zero_shot_with_pca(self, data_dict, compound_projections, pca_components=2):
-        """使用实时提取的语义和PCA降维后的欧氏距离进行零样本复合故障分类"""
-        print(f"\n评估零样本复合故障分类能力（使用{pca_components}维PCA降维后的欧氏距离）...")
-
-        # 2. 获取测试数据 - 仅复合故障
-        X_test, y_test = data_dict['X_test'], data_dict['y_test']
-
-        compound_fault_types_names = list(compound_projections.keys())
-        compound_fault_indices = [self.fault_types[name] for name in compound_fault_types_names if
-                                  name in self.fault_types]
-
-        test_compound_mask = np.isin(y_test, compound_fault_indices)
-        X_compound_test_orig = X_test[test_compound_mask]
-        y_compound_test_orig = y_test[test_compound_mask]
-
-
-        finite_mask_test = np.all(np.isfinite(X_compound_test_orig), axis=1)
-        X_compound_test = X_compound_test_orig[finite_mask_test]
-        y_compound_test = y_compound_test_orig[finite_mask_test]
-
-        # 3. 准备投影特征
-        candidate_labels_names = []
-        projection_features_list = []
-        candidate_fault_indices = []
-
-        for fault_name, projection in compound_projections.items():
-            if fault_name in self.fault_types and np.all(np.isfinite(projection)):
-                candidate_labels_names.append(fault_name)
-                projection_features_list.append(projection)
-                candidate_fault_indices.append(self.fault_types[fault_name])
-
-        projection_features_np = np.array(projection_features_list)
-
-        # 4. 提取测试样本特征 - 使用自编码器实时提取语义
-        self.cnn_model.eval()
-        self.semantic_builder.autoencoder.eval()
-        test_features_list_extracted = []
-        valid_test_labels_list = []
-        batch_size_eval = getattr(self, 'batch_size', 64)
-
-        with torch.no_grad():
-            for i in range(0, len(X_compound_test), batch_size_eval):
-                batch_x_signal = torch.FloatTensor(X_compound_test[i:i + batch_size_eval]).to(self.device)
-                batch_y_labels = y_compound_test[i:i + batch_size_eval]
-
-                # 准备AE输入 (应为 [B, SEGMENT_LENGTH])
-                if batch_x_signal.dim() == 3 and batch_x_signal.shape[1] == 1:  # If [B, 1, L]
-                    ae_batch_x = batch_x_signal.squeeze(1)
-                elif batch_x_signal.dim() == 2:  # If [B, L]
-                    ae_batch_x = batch_x_signal
+                if sem_vec is not None and np.all(np.isfinite(sem_vec)) and len(sem_vec) == self.fused_semantic_dim:
+                    target_compound_semantics[fault_type] = sem_vec
                 else:
                     print(
-                        f"W: evaluate_zero_shot_with_pca - Unexpected shape for AE input: {batch_x_signal.shape}. Skipping batch.")
+                        f"警告: '{fault_type}' 的融合语义无效或维度错误 (expected {self.fused_semantic_dim}, got {len(sem_vec) if sem_vec is not None else 'None'}). 将尝试修复/重新生成。")
+
+                    regenerated_sem = self.semantic_builder._generate_fallback_semantics([fault_type],
+                                                                                         semantic_dict.get(
+                                                                                             'data_prototypes', {}))
+                    if fault_type in regenerated_sem and np.all(np.isfinite(regenerated_sem[fault_type])) and len(
+                            regenerated_sem[fault_type]) == self.actual_ae_latent_dim:
+                        k_sem = semantic_dict.get('knowledge_semantics', {}).get(fault_type)
+                        if k_sem is not None and np.all(np.isfinite(k_sem)) and len(
+                                k_sem) == self.semantic_builder.knowledge_dim:
+                            fused_fallback = np.concatenate([k_sem, regenerated_sem[fault_type]]).astype(np.float32)
+                            if np.all(np.isfinite(fused_fallback)) and len(fused_fallback) == self.fused_semantic_dim:
+                                target_compound_semantics[fault_type] = fused_fallback
+                                print(f"  - 成功为 '{fault_type}' 生成回退融合语义。")
+                            else:
+                                print(f"  - 错误: 为 '{fault_type}' 生成的回退融合语义在拼接后无效。")
+                        else:
+                            print(f"  - 错误: 为 '{fault_type}' 生成回退融合语义时缺少知识语义部分。")
+                    else:
+                        print(f"  - 错误: 无法为 '{fault_type}' 生成有效的融合语义作为目标。")
+            else:
+                print(f"警告: 复合故障类型 '{fault_type}' 在融合语义中未定义。")
+
+        if not target_compound_semantics:
+            print("错误: 未能获取任何有效的复合故障目标语义。")
+            return None
+
+        print(f"成功获取 {len(target_compound_semantics)} 种复合故障的目标融合语义。")
+        return target_compound_semantics
+
+    def evaluate_zero_shot_with_pca(self, data_dict, target_compound_semantics, pca_components=3):
+        """使用SAE投影的语义和PCA降维后的欧氏距离进行零样本复合故障分类"""
+        print(f"\n评估ZSL（PCA方法）：使用SAE投影语义，在{pca_components}维PCA空间比较...")
+
+        self.cnn_model.eval()
+        self.sae_model.eval()
+        self.semantic_builder.autoencoder.eval()
+        self.semantic_builder.attribute_mapper.eval()  # Ensure attribute mapper is in eval mode
+
+        # Use the stored test data and their HF/LF ratios
+        X_test_signals, y_test_labels, hf_lf_test_ratios = self.X_test_signals, self.y_test_labels, self.hf_lf_test_ratios
+
+        valid_compound_fault_names = list(target_compound_semantics.keys())
+        valid_compound_fault_indices = [self.fault_types[name] for name in valid_compound_fault_names if
+                                        name in self.fault_types]
+
+        mask_eval = np.isin(y_test_labels, valid_compound_fault_indices)
+        X_eval_signals = X_test_signals[mask_eval]
+        y_eval_labels = y_test_labels[mask_eval]
+        hf_lf_eval_ratios = hf_lf_test_ratios[mask_eval]  # Get HF/LF ratios for the evaluation segments
+
+        # --- NEW: Generate candidate reference semantics dynamically using the AttributeMapper ---
+        # This implements '方案 A：枚举属性组合' for inference
+        all_possible_location_attributes = [  # 7 fault types (excluding normal)
+            [1, 0, 0], [0, 1, 0], [0, 0, 1],  # Single
+            [1, 1, 0], [1, 0, 1], [0, 1, 1],  # Double
+            [1, 1, 1]  # Triple
+        ]
+
+        reference_semantic_vectors_list = []
+        reference_labels_list = []  # Store corresponding fault indices
+        reference_fault_names = []  # Store corresponding fault names
+
+        # For each test sample, we'll compare its projected semantic with these dynamically generated candidates
+        # We need a way to get *typical* HF/LF values for each *type* of compound fault.
+        # For simplicity in evaluation, we can average the HF/LF ratios from our pseudo-compound data or test data.
+        # However, for pure ZSL, these HF/LF for candidate semantic vectors would ideally be derived from the *test signal itself*
+        # or from a pre-defined typical range for each fault type.
+        # For this evaluation, we'll generate candidate semantics based on the *average HF/LF of the test set*
+        # for a more realistic comparison against the model's projection.
+
+        avg_hf_test = np.mean(hf_lf_eval_ratios[:, 0]) if hf_lf_eval_ratios.shape[0] > 0 else 0.5
+        avg_lf_test = np.mean(hf_lf_eval_ratios[:, 1]) if hf_lf_eval_ratios.shape[0] > 0 else 0.5
+
+        with torch.no_grad():
+            for loc_attr in all_possible_location_attributes:
+                # Construct 5-dim attribute vector for each candidate
+                # Using average HF/LF from test set for candidate generation here.
+                # In a real scenario, you'd feed the test signal's *own* HF/LF into Mapper.
+                candidate_attr_5d = np.array(loc_attr + [avg_hf_test, avg_lf_test], dtype=np.float32)
+                candidate_attr_tensor = torch.FloatTensor(candidate_attr_5d).unsqueeze(0).to(self.device)
+
+                # Mapper predicts semantic vector for this candidate attribute
+                predicted_candidate_semantic = self.semantic_builder.attribute_mapper(
+                    candidate_attr_tensor).cpu().numpy().squeeze(0)
+
+                reference_semantic_vectors_list.append(predicted_candidate_semantic)
+
+                # Determine the fault name and index for this location attribute
+                fault_name = None
+                for name, attr_val in self.fault_location_attributes.items():
+                    if np.array_equal(attr_val, loc_attr):
+                        fault_name = name
+                        break
+                if fault_name:
+                    reference_labels_list.append(self.fault_types[fault_name])
+                    reference_fault_names.append(fault_name)
+                else:
+                    # Handle cases where a location attribute might not map to a defined fault name (e.g., [0,0,0])
+                    # Ensure fault_types contains all 7 compound + 1 normal
+                    pass
+
+        reference_semantic_vectors_np = np.array(reference_semantic_vectors_list)
+
+        predicted_semantic_vectors_list = []
+        actual_labels_for_pred_list = []
+        batch_size_eval = self.batch_size
+
+        with torch.no_grad():
+            for i in range(0, len(X_eval_signals), batch_size_eval):
+                batch_x_sig = torch.FloatTensor(X_eval_signals[i:i + batch_size_eval]).to(self.device)
+                batch_y_lbl = y_eval_labels[i:i + batch_size_eval]
+
+                ae_input = batch_x_sig.squeeze(1) if batch_x_sig.dim() == 3 and batch_x_sig.shape[
+                    1] == 1 else batch_x_sig
+                if ae_input.dim() != 2 or ae_input.shape[1] != self.semantic_builder.autoencoder.input_length:
+                    print(
+                        f"W: Eval PCA - AE input shape mismatch. Expected [B, {self.semantic_builder.autoencoder.input_length}], got {ae_input.shape}. Skipping batch.")
                     continue
 
-                real_time_semantics = self.semantic_builder.autoencoder.encode(ae_batch_x)
-                features = self.cnn_model(batch_x_signal, semantic=real_time_semantics, return_features=True)
-                test_features_list_extracted.append(features.cpu().numpy())
-                valid_test_labels_list.extend(batch_y_labels.tolist())
+                current_ae_sem = self.semantic_builder.autoencoder.encode(ae_input)
+                cnn_feats = self.cnn_model(batch_x_sig, current_ae_sem, return_features=True)
+                sae_pred_sem = self.sae_model(cnn_feats)
 
+                predicted_semantic_vectors_list.append(sae_pred_sem.cpu().numpy())
+                actual_labels_for_pred_list.extend(batch_y_lbl)
+        predicted_semantic_vectors_np = np.vstack(predicted_semantic_vectors_list)
+        y_eval_labels_final = np.array(actual_labels_for_pred_list)
 
-        test_features_np = np.vstack(test_features_list_extracted)
-        y_compound_test_final = np.array(valid_test_labels_list)
-        all_features_for_pca = np.vstack([test_features_np, projection_features_np])
+        # --- PCA for Visualization and Distance Calculation ---
+        all_semantics_for_pca = np.vstack([predicted_semantic_vectors_np, reference_semantic_vectors_np])
 
-        actual_pca_components = min(pca_components, all_features_for_pca.shape[0], all_features_for_pca.shape[1])
-        pca = PCA(n_components=actual_pca_components)
-        pca.fit(all_features_for_pca)
+        actual_pca_comps = min(pca_components, all_semantics_for_pca.shape[0], all_semantics_for_pca.shape[1])
+        if actual_pca_comps < 2:
+            print(
+                "Warning: Not enough components for PCA (requires at least 2 components). Skipping PCA visualization.")
+            # Fallback to direct distance calculation if PCA not possible or meaningful
+            pca = None
+            predicted_sem_pca = predicted_semantic_vectors_np
+            reference_sem_pca = reference_semantic_vectors_np
+        else:
+            pca = PCA(n_components=actual_pca_comps)
+            pca.fit(all_semantics_for_pca)
 
-        test_features_pca = pca.transform(test_features_np)
-        projection_features_pca = pca.transform(projection_features_np)
+            predicted_sem_pca = pca.transform(predicted_semantic_vectors_np)
+            reference_sem_pca = pca.transform(reference_semantic_vectors_np)
+            print(
+                f"  语义空间维度: {predicted_semantic_vectors_np.shape[1]} -> PCA降维后: {predicted_sem_pca.shape[1]}")
 
-        print(f"  原始特征维度: {test_features_np.shape[1]} -> PCA降维后: {test_features_pca.shape[1]}")
-
-        # 6. 在PCA空间中进行分类
-        y_pred_list = []
-        for i in range(len(test_features_pca)):
-            dists = [np.linalg.norm(test_features_pca[i] - proj) for proj in projection_features_pca]
+        y_classified_indices = []
+        for pred_pca_vec in predicted_sem_pca:
+            dists = [np.linalg.norm(pred_pca_vec - ref_pca_vec) for ref_pca_vec in reference_sem_pca]
             nearest_idx = np.argmin(dists)
-            y_pred_list.append(candidate_fault_indices[nearest_idx])
+            y_classified_indices.append(reference_labels_list[nearest_idx])  # Predicted fault index
 
-        y_pred_np = np.array(y_pred_list)
+        y_classified_indices_np = np.array(y_classified_indices)
 
-        # 7. 计算指标
-        accuracy = np.mean(y_pred_np == y_compound_test_final) * 100
+        accuracy = accuracy_score(y_eval_labels_final, y_classified_indices_np) * 100
         class_accuracy_results = {}
-        print("\n=== 各类别分类详情 (PCA) ===")
-        for fault_idx_true in np.unique(y_compound_test_final):
-            mask = (y_compound_test_final == fault_idx_true)
+        print("\n=== 各类别分类详情 (PCA + 欧氏距离, 语义空间) ===")
+        for fault_idx_true in np.unique(y_eval_labels_final):
+            mask = (y_eval_labels_final == fault_idx_true)
             count = np.sum(mask)
-            correct_count = np.sum(y_pred_np[mask] == y_compound_test_final[mask])
+            correct_count = np.sum(y_classified_indices_np[mask] == y_eval_labels_final[
+                mask])  # Check if classified index matches true index
             acc = (correct_count / count) * 100 if count > 0 else 0
             fault_name = self.idx_to_fault.get(fault_idx_true, f"Unknown_{fault_idx_true}")
             class_accuracy_results[fault_name] = acc
             print(f"类别 {fault_name}: {correct_count}/{count} 正确, 准确率 {acc:.2f}%")
-        print(f"\n总体准确率 (PCA): {accuracy:.2f}%")
+        print(f"\n总体准确率 (PCA, 语义空间): {accuracy:.2f}%")
 
-        # 8. 可视化混淆矩阵
-        true_labels_str_pca = [self.idx_to_fault.get(l, f"Unk_{l}") for l in y_compound_test_final]
-        pred_labels_str_pca = [self.idx_to_fault.get(l, f"Unk_{l}") for l in y_pred_np]
-        # Ensure all candidate fault names are used as labels for CM
-        display_labels_cm_pca = sorted(
-            list(set(true_labels_str_pca) | set(pred_labels_str_pca) | set(candidate_labels_names)))
+        # Confusion Matrix
+        true_labels_str = [self.idx_to_fault.get(l, f"Unk_{l}") for l in y_eval_labels_final]
+        pred_labels_str = [self.idx_to_fault.get(l, f"Unk_{l}") for l in y_classified_indices_np]
+        # Use names from reference_fault_names (all 7 possible compound types) as the full set of labels for CM display
+        cm_display_labels = sorted(list(set(reference_fault_names)))  # Make sure to sort for consistent plotting
 
-        conf_matrix_pca_val = None
-        conf_matrix_pca_val = confusion_matrix(true_labels_str_pca, pred_labels_str_pca,
-                                               labels=display_labels_cm_pca)
         configure_chinese_font()
         plt.figure(figsize=(10, 8))
-        sns.heatmap(conf_matrix_pca_val, annot=True, fmt='d', cmap='Blues', xticklabels=display_labels_cm_pca,
-                    yticklabels=display_labels_cm_pca)
+        sns.heatmap(confusion_matrix(true_labels_str, pred_labels_str, labels=cm_display_labels), annot=True, fmt='d',
+                    cmap='Blues',
+                    xticklabels=cm_display_labels, yticklabels=cm_display_labels)
         plt.xlabel('预测')
         plt.ylabel('真实')
-        plt.title(f'零样本学习混淆矩阵 (实时语义+PCA+欧式距离, 准确率: {accuracy:.2f}%)')
-        plt.xticks(rotation=45, ha='right')
-        plt.yticks(rotation=0)
-        plt.tight_layout()
-        plt.savefig('compound_fault_confusion_matrix_zsl_pca_realtime.png')
-        plt.close()
-        print("混淆矩阵 (PCA) 已保存至 'compound_fault_confusion_matrix_zsl_pca_realtime.png'")
-
-
-
-        return accuracy, class_accuracy_results  # Return class_accuracy_results instead of conf_matrix
-
-    def evaluate_zero_shot_with_tsne(self, data_dict, compound_projections, tsne_perplexity=30, tsne_n_iter=1000,
-                                     tsne_components=2):
-        """
-        Evaluates zero-shot classification by projecting features to t-SNE space first,
-        then classifying using nearest centroid in the t-SNE space.
-        """
-        print(f"\n评估零样本复合故障分类能力（使用{tsne_components}D t-SNE降维后的欧氏距离）...")
-
-        # 1. Prepare high-dimensional target projections
-        candidate_labels_names = []
-        projection_features_list_high_dim = []
-        candidate_fault_indices = []
-
-        for fault_name, projection_vec in compound_projections.items():
-            if fault_name in self.fault_types and np.all(np.isfinite(projection_vec)):
-                candidate_labels_names.append(fault_name)
-                projection_features_list_high_dim.append(projection_vec)
-                candidate_fault_indices.append(self.fault_types[fault_name])
-            else:
-                print(f"  通知: '{fault_name}' 的投影无效或不在故障类型中，已在t-SNE评估中跳过。")
-
-        if not projection_features_list_high_dim:
-            print("错误: 没有有效的复合故障投影可用于t-SNE评估。")
-            return 0.0, None
-        projection_features_np_high_dim = np.array(projection_features_list_high_dim)
-
-        # 2. Prepare high-dimensional actual test data features
-        X_test_orig, y_test_orig = data_dict['X_test'], data_dict['y_test']
-
-        # Filter test data to only include compound faults for which we have projections
-        test_compound_mask = np.isin(y_test_orig, candidate_fault_indices)
-        X_compound_test_for_eval = X_test_orig[test_compound_mask]
-        y_compound_test_for_eval = y_test_orig[test_compound_mask]
-
-        if X_compound_test_for_eval.shape[0] == 0:
-            print("错误: 没有找到与候选投影匹配的测试样本用于t-SNE评估。")
-            return 0.0, None
-
-        # Extract features for these test samples using the trained CNN and AE semantics
-        self.cnn_model.eval()
-        self.semantic_builder.autoencoder.eval()
-        test_features_list_extracted_high_dim = []
-        # Keep track of labels corresponding to successfully extracted features
-        y_compound_test_successfully_extracted = []
-
-        batch_size_eval = getattr(self, 'batch_size', DEFAULT_BATCH_SIZE)
-
-        with torch.no_grad():
-            for i in range(0, X_compound_test_for_eval.shape[0], batch_size_eval):
-                batch_x_signal = torch.FloatTensor(X_compound_test_for_eval[i:i + batch_size_eval]).to(self.device)
-                batch_y_labels = y_compound_test_for_eval[i:i + batch_size_eval]
-
-                # Prepare AE input (should be [B, SEGMENT_LENGTH])
-                ae_batch_x = batch_x_signal.squeeze(1) if batch_x_signal.dim() == 3 and batch_x_signal.shape[
-                    1] == 1 else batch_x_signal
-
-                try:
-                    real_time_semantics = self.semantic_builder.autoencoder.encode(ae_batch_x)
-                    cnn_features = self.cnn_model(batch_x_signal, semantic=real_time_semantics, return_features=True)
-
-                    if torch.all(torch.isfinite(cnn_features)):
-                        test_features_list_extracted_high_dim.append(cnn_features.cpu().numpy())
-                        y_compound_test_successfully_extracted.extend(batch_y_labels.tolist())
-                    else:
-                        print(
-                            f"  通知: 从CNN提取的特征包含无效值（批次 {i // batch_size_eval}），已在t-SNE评估中跳过该批次。")
-                except Exception as e:
-                    print(f"  错误: 在为t-SNE评估提取特征时发生错误（批次 {i // batch_size_eval}）: {e}，已跳过该批次。")
-                    continue
-
-        if not test_features_list_extracted_high_dim:
-            print("错误: 未能为测试样本提取任何有效的高维特征用于t-SNE评估。")
-            return 0.0, None
-        test_features_np_high_dim = np.vstack(test_features_list_extracted_high_dim)
-        y_compound_test_final_true_labels = np.array(y_compound_test_successfully_extracted)
-
-        if test_features_np_high_dim.shape[0] == 0:  # Should be caught by the list check, but good for safety
-            print("错误: 提取的测试特征数组为空。")
-            return 0.0, None
-
-        # 3. Combine projections and actual test features for t-SNE
-        all_features_to_embed_high_dim = np.vstack([projection_features_np_high_dim, test_features_np_high_dim])
-
-        num_total_points = all_features_to_embed_high_dim.shape[0]
-        # Adjust perplexity if it's too high for the number of points
-        effective_perplexity = min(tsne_perplexity, num_total_points - 1)
-
-        if effective_perplexity < 1:  # Need at least 1 for perplexity, but practically > 5 is better
-            print(f"警告: 由于样本量过小 ({num_total_points})，无法应用t-SNE。已跳过t-SNE评估。")
-            return 0.0, None
-
-        print(f"  正在对 {num_total_points} 个点应用t-SNE（perplexity={effective_perplexity}）...")
-        tsne_embedder = TSNE(n_components=tsne_components, perplexity=effective_perplexity, n_iter=tsne_n_iter,
-                             random_state=42, init='pca', learning_rate='auto')
-
-        try:
-            all_features_embedded_low_dim = tsne_embedder.fit_transform(all_features_to_embed_high_dim)
-        except Exception as e:
-            print(f"错误: t-SNE fit_transform 执行失败: {e}。已跳过t-SNE评估。")
-            return 0.0, None
-
-        # Separate back into projections and test features in the low-dimensional space
-        projection_features_tsne_embedded = all_features_embedded_low_dim[:len(projection_features_np_high_dim)]
-        test_features_tsne_embedded = all_features_embedded_low_dim[len(projection_features_np_high_dim):]
-
-        # 4. Classify in the t-SNE embedded space using nearest prototype
-        y_predicted_in_tsne_space = []
-        for test_vec_tsne in test_features_tsne_embedded:
-            distances_to_projections = [np.linalg.norm(test_vec_tsne - proj_vec_tsne) for proj_vec_tsne in
-                                        projection_features_tsne_embedded]
-            nearest_projection_idx = np.argmin(distances_to_projections)
-            y_predicted_in_tsne_space.append(candidate_fault_indices[nearest_projection_idx])
-        y_predicted_np = np.array(y_predicted_in_tsne_space)
-
-        # 5. Calculate metrics
-        accuracy_tsne_eval = accuracy_score(y_compound_test_final_true_labels, y_predicted_np) * 100
-
-        class_accuracy_results = {}
-        print("\n=== 各类别分类详情 (t-SNE) ===")
-        unique_true_labels_in_test = np.unique(y_compound_test_final_true_labels)
-        for true_label_idx in unique_true_labels_in_test:
-            mask = (y_compound_test_final_true_labels == true_label_idx)
-            class_count = np.sum(mask)
-            if class_count > 0:
-                correct_preds_in_class = np.sum(y_predicted_np[mask] == true_label_idx)
-                class_acc = (correct_preds_in_class / class_count) * 100
-            else:  # Should not happen if unique_true_labels_in_test is from y_compound_test_final_true_labels
-                class_acc = 0.0
-                correct_preds_in_class = 0
-
-            fault_name_str = self.idx_to_fault.get(true_label_idx, f"未知_{true_label_idx}")
-            class_accuracy_results[fault_name_str] = class_acc
-            print(f"类别 '{fault_name_str}': {correct_preds_in_class}/{class_count} 正确, 准确率 {class_acc:.2f}%")
-
-        print(f"\n总体准确率 (t-SNE + 欧式距离): {accuracy_tsne_eval:.2f}%")
-
-        # 6. Visualize Confusion Matrix
-        true_labels_for_cm = [self.idx_to_fault.get(l, f"Unk_{l}") for l in y_compound_test_final_true_labels]
-        predicted_labels_for_cm = [self.idx_to_fault.get(l, f"Unk_{l}") for l in y_predicted_np]
-
-        # Ensure all candidate names (from projections) are included as labels for CM display
-        cm_display_labels = sorted(
-            list(set(true_labels_for_cm) | set(predicted_labels_for_cm) | set(candidate_labels_names)))
-
-        confusion_mat_tsne = confusion_matrix(true_labels_for_cm, predicted_labels_for_cm, labels=cm_display_labels)
-
-        if 'configure_chinese_font' in globals() or 'configure_chinese_font' in locals():
-            configure_chinese_font()  # Call if available
-
-        plt.figure(figsize=(12, 10))
-        sns.heatmap(confusion_mat_tsne, annot=True, fmt='d', cmap='Blues', xticklabels=cm_display_labels,
-                    yticklabels=cm_display_labels)
-        plt.xlabel('预测标签 (t-SNE空间)')
-        plt.ylabel('真实标签 (t-SNE空间)')
-        plt.title(f'零样本学习混淆矩阵 (t-SNE, 准确率: {accuracy_tsne_eval:.2f}%)')
+        plt.title(f'ZSL混淆矩阵 (SAE投影语义+PCA, 准确率: {accuracy:.2f}%)')
         plt.xticks(rotation=45, ha='right');
         plt.yticks(rotation=0)
         plt.tight_layout()
-        plt.savefig('compound_fault_confusion_matrix_zsl_tsne_realtime.png')
+        plt.savefig('compound_fault_cm_zsl_sae_pca.png')
         plt.close()
-        print("混淆矩阵 (t-SNE) 已保存至 'compound_fault_confusion_matrix_zsl_tsne_realtime.png'")
+        print("混淆矩阵 (SAE+PCA) 已保存至 'compound_fault_cm_zsl_sae_pca.png'")
 
-        return accuracy_tsne_eval, class_accuracy_results
-    def evaluate_zero_shot_with_cosine_similarity(self, data_dict, compound_projections):
-        """使用实时提取的语义和原始特征空间中的余弦相似度进行零样本复合故障分类"""
-        print("\n使用实时语义和余弦相似度评估零样本复合故障分类能力...")
-        # 2. 获取测试数据
-        X_test, y_test = data_dict['X_test'], data_dict['y_test']
-        compound_fault_types_names_cosine = list(compound_projections.keys())
-        compound_fault_indices_cosine = [self.fault_types[name] for name in compound_fault_types_names_cosine if
-                                         name in self.fault_types]
+        return accuracy, class_accuracy_results
 
-        test_compound_mask_cosine = np.isin(y_test, compound_fault_indices_cosine)
-        X_compound_test_orig_cosine = X_test[test_compound_mask_cosine]
-        y_compound_test_orig_cosine = y_test[test_compound_mask_cosine]
-        finite_mask_test_cosine = np.all(np.isfinite(X_compound_test_orig_cosine), axis=1)
-        X_compound_test_cosine = X_compound_test_orig_cosine[finite_mask_test_cosine]
-        y_compound_test_cosine = y_compound_test_orig_cosine[finite_mask_test_cosine]
-        print(
-            f"  使用 {len(X_compound_test_cosine)} 个复合故障测试样本评估 {len(compound_fault_indices_cosine)} 种复合故障 (余弦评估)")
+    def evaluate_zero_shot_with_cosine_similarity(self, data_dict, target_compound_semantics):
+        """使用SAE投影的语义和原始语义空间中的余弦相似度进行零样本复合故障分类"""
+        print("\n评估ZSL（余弦相似度方法）：使用SAE投影语义，在原始融合语义空间比较...")
 
-        # 3. 准备投影特征 (原始空间)
-        candidate_fault_names_cosine = []
-        projection_features_orig_list_cosine = []
-        for name, projection in compound_projections.items():
-            if name in self.fault_types and np.all(np.isfinite(projection)):
-                candidate_fault_names_cosine.append(name)
-                projection_features_orig_list_cosine.append(projection)
-        projection_features_orig_np_cosine = np.array(projection_features_orig_list_cosine)
-        projection_features_norm_cosine = projection_features_orig_np_cosine / (
-                np.linalg.norm(projection_features_orig_np_cosine, axis=1, keepdims=True) + 1e-9)
-
-        # 4. 提取实际测试特征 (原始空间) - 使用实时提取的语义
         self.cnn_model.eval()
+        self.sae_model.eval()
         self.semantic_builder.autoencoder.eval()
-        test_features_orig_list_extracted_cosine = []
-        valid_test_labels_list_cosine = []
-        batch_size_eval_cosine = getattr(self, 'batch_size', 64)
+        self.semantic_builder.attribute_mapper.eval()  # Ensure attribute mapper is in eval mode
+
+        # Use the stored test data and their HF/LF ratios
+        X_test_signals, y_test_labels, hf_lf_test_ratios = self.X_test_signals, self.y_test_labels, self.hf_lf_test_ratios
+
+        valid_compound_fault_names = list(target_compound_semantics.keys())
+        valid_compound_fault_indices = [self.fault_types[name] for name in valid_compound_fault_names if
+                                        name in self.fault_types]
+
+        mask_eval_cosine = np.isin(y_test_labels, valid_compound_fault_indices)
+        X_eval_signals_cosine = X_test_signals[mask_eval_cosine]
+        y_eval_labels_cosine = y_test_labels[mask_eval_cosine]
+        hf_lf_eval_ratios_cosine = hf_lf_test_ratios[mask_eval_cosine]  # Get HF/LF ratios for evaluation
+
+        # --- NEW: Generate candidate reference semantics dynamically using the AttributeMapper ---
+        all_possible_location_attributes = [  # 7 fault types (excluding normal)
+            [1, 0, 0], [0, 1, 0], [0, 0, 1],  # Single
+            [1, 1, 0], [1, 0, 1], [0, 1, 1],  # Double
+            [1, 1, 1]  # Triple
+        ]
+
+        reference_semantic_vectors_list_cos = []
+        reference_labels_list_cos = []
+        reference_fault_names_cos = []  # Store fault names for CM
+
+        # Calculate average HF/LF from the test set for dynamic candidate generation
+        avg_hf_test_cos = np.mean(hf_lf_eval_ratios_cosine[:, 0]) if hf_lf_eval_ratios_cosine.shape[0] > 0 else 0.5
+        avg_lf_test_cos = np.mean(hf_lf_eval_ratios_cosine[:, 1]) if hf_lf_eval_ratios_cosine.shape[0] > 0 else 0.5
+
         with torch.no_grad():
-            for i in range(0, len(X_compound_test_cosine), batch_size_eval_cosine):
-                batch_x_signal_cosine = torch.FloatTensor(X_compound_test_cosine[i:i + batch_size_eval_cosine]).to(
-                    self.device)
-                batch_y_labels_cosine = y_compound_test_cosine[i:i + batch_size_eval_cosine]
+            for loc_attr in all_possible_location_attributes:
+                candidate_attr_5d_cos = np.array(loc_attr + [avg_hf_test_cos, avg_lf_test_cos], dtype=np.float32)
+                candidate_attr_tensor_cos = torch.FloatTensor(candidate_attr_5d_cos).unsqueeze(0).to(self.device)
 
-                if batch_x_signal_cosine.dim() == 3 and batch_x_signal_cosine.shape[1] == 1:
-                    ae_batch_x_cosine = batch_x_signal_cosine.squeeze(1)
-                elif batch_x_signal_cosine.dim() == 2:
-                    ae_batch_x_cosine = batch_x_signal_cosine
+                predicted_candidate_semantic_cos = self.semantic_builder.attribute_mapper(
+                    candidate_attr_tensor_cos).cpu().numpy().squeeze(0)
+
+                reference_semantic_vectors_list_cos.append(predicted_candidate_semantic_cos)
+
+                fault_name = None
+                for name, attr_val in self.fault_location_attributes.items():
+                    if np.array_equal(attr_val, loc_attr):
+                        fault_name = name
+                        break
+                if fault_name:
+                    reference_labels_list_cos.append(self.fault_types[fault_name])
+                    reference_fault_names_cos.append(fault_name)
                 else:
+                    pass  # Handle if needed
+
+        reference_semantic_vectors_np_cos = np.array(reference_semantic_vectors_list_cos)
+        reference_semantic_norm_cos = reference_semantic_vectors_np_cos / (
+                np.linalg.norm(reference_semantic_vectors_np_cos, axis=1, keepdims=True) + 1e-9)
+
+        predicted_semantic_vectors_list_cos = []
+        actual_labels_for_pred_list_cos = []
+        batch_size_eval = self.batch_size
+
+        with torch.no_grad():
+            for i in range(0, len(X_eval_signals_cosine), batch_size_eval):
+                batch_x_sig_cos = torch.FloatTensor(X_eval_signals_cosine[i:i + batch_size_eval]).to(self.device)
+                batch_y_lbl_cos = y_eval_labels_cosine[i:i + batch_size_eval]
+
+                ae_input_cos = batch_x_sig_cos.squeeze(1) if batch_x_sig_cos.dim() == 3 and batch_x_sig_cos.shape[
+                    1] == 1 else batch_x_sig_cos
+                if ae_input_cos.dim() != 2 or ae_input_cos.shape[1] != self.semantic_builder.autoencoder.input_length:
                     print(
-                        f"W: evaluate_zero_shot_with_cosine_similarity - Unexpected shape for AE input: {batch_x_signal_cosine.shape}. Skipping batch.")
+                        f"W: Eval Cosine - AE input shape mismatch. Expected [B, {self.semantic_builder.autoencoder.input_length}], got {ae_input_cos.shape}. Skipping batch.")
                     continue
+                current_ae_sem_cos = self.semantic_builder.autoencoder.encode(ae_input_cos)
 
-                real_time_semantics_cosine = self.semantic_builder.autoencoder.encode(ae_batch_x_cosine)
+                cnn_feats_cos = self.cnn_model(batch_x_sig_cos, current_ae_sem_cos, return_features=True)
+                sae_pred_sem_cos = self.sae_model(cnn_feats_cos)
 
-                features_cosine = self.cnn_model(batch_x_signal_cosine, semantic=real_time_semantics_cosine,
-                                                 return_features=True)
+                predicted_semantic_vectors_list_cos.append(sae_pred_sem_cos.cpu().numpy())
+                actual_labels_for_pred_list_cos.extend(batch_y_lbl_cos)
 
+        predicted_semantic_vectors_np_cos = np.vstack(predicted_semantic_vectors_list_cos)
+        y_eval_labels_final_cos = np.array(actual_labels_for_pred_list_cos)
+        predicted_semantic_norm_cos = predicted_semantic_vectors_np_cos / (
+                np.linalg.norm(predicted_semantic_vectors_np_cos, axis=1, keepdims=True) + 1e-9)
 
-                test_features_orig_list_extracted_cosine.append(features_cosine.cpu().numpy())
-                valid_test_labels_list_cosine.extend(batch_y_labels_cosine.tolist())
+        # Classification using Cosine Similarity
+        similarity_matrix = np.dot(predicted_semantic_norm_cos, reference_semantic_norm_cos.T)
+        y_classified_indices_cos = []
+        for i in range(similarity_matrix.shape[0]):
+            nearest_idx = np.argmax(similarity_matrix[i])
+            y_classified_indices_cos.append(reference_labels_list_cos[nearest_idx])
 
-        test_features_orig_np_cosine = np.vstack(test_features_orig_list_extracted_cosine)
-        y_compound_test_final_cosine = np.array(valid_test_labels_list_cosine)
-        test_features_norm_cosine = test_features_orig_np_cosine / (
-                np.linalg.norm(test_features_orig_np_cosine, axis=1, keepdims=True) + 1e-9)
+        y_classified_indices_np_cos = np.array(y_classified_indices_cos)
 
-        similarity_matrix_cosine = np.dot(test_features_norm_cosine, projection_features_norm_cosine.T)
-        y_pred_cosine_list = []
-        for i in range(len(test_features_norm_cosine)):
-            nearest_idx_cosine = np.argmax(similarity_matrix_cosine[i])
-            y_pred_cosine_list.append(self.fault_types[candidate_fault_names_cosine[nearest_idx_cosine]])
-
-        y_pred_np_cosine = np.array(y_pred_cosine_list)
-
-        # 6. Calculate Metrics
-        from sklearn.metrics import accuracy_score  # Moved import here
-        accuracy_cosine_val = accuracy_score(y_compound_test_final_cosine, y_pred_np_cosine) * 100
+        accuracy_cos = accuracy_score(y_eval_labels_final_cos, y_classified_indices_np_cos) * 100
         class_accuracy_cosine_results = {}
-        print("\n=== 各类别分类详情 (余弦相似度) ===")
-        for fault_idx_true_cosine in np.unique(y_compound_test_final_cosine):
-            mask_cosine = (y_compound_test_final_cosine == fault_idx_true_cosine)
-            count_cosine = np.sum(mask_cosine)
-            correct_count_cosine = np.sum(y_pred_np_cosine[mask_cosine] == y_compound_test_final_cosine[mask_cosine])
-            acc_cosine = (correct_count_cosine / count_cosine) * 100 if count_cosine > 0 else 0
-            fault_name_cosine = self.idx_to_fault.get(fault_idx_true_cosine, f"Unknown_{fault_idx_true_cosine}")
-            class_accuracy_cosine_results[fault_name_cosine] = acc_cosine
-            print(f"类别 {fault_name_cosine}: {correct_count_cosine}/{count_cosine} 正确, 准确率 {acc_cosine:.2f}%")
-        print(f"\n总体准确率 (余弦相似度): {accuracy_cosine_val:.2f}%")
+        print("\n=== 各类别分类详情 (余弦相似度, 语义空间) ===")
+        for fault_idx_true_cos in np.unique(y_eval_labels_final_cos):
+            mask_cos = (y_eval_labels_final_cos == fault_idx_true_cos)
+            count_cos = np.sum(mask_cos)
+            correct_count_cos = np.sum(y_classified_indices_np_cos[mask_cos] == y_eval_labels_final_cos[mask_cos])
+            acc_cos_cls = (correct_count_cos / count_cos) * 100 if count_cos > 0 else 0
+            fault_name_cos = self.idx_to_fault.get(fault_idx_true_cos, f"Unknown_{fault_idx_true_cos}")
+            class_accuracy_cosine_results[fault_name_cos] = acc_cos_cls
+            print(f"类别 {fault_name_cos}: {correct_count_cos}/{count_cos} 正确, 准确率 {acc_cos_cls:.2f}%")
+        print(f"\n总体准确率 (余弦相似度, 语义空间): {accuracy_cos:.2f}%")
 
-        # 7. Visualize Confusion Matrix
-        true_labels_str_cosine = [self.idx_to_fault.get(l, f"Unk_{l}") for l in y_compound_test_final_cosine]
-        pred_labels_str_cosine = [self.idx_to_fault.get(l, f"Unk_{l}") for l in y_pred_np_cosine]
-        display_labels_cm_cosine = sorted(
-            list(set(true_labels_str_cosine) | set(pred_labels_str_cosine) | set(candidate_fault_names_cosine)))
+        # Confusion Matrix
+        true_labels_str_cos = [self.idx_to_fault.get(l, f"Unk_{l}") for l in y_eval_labels_final_cos]
+        pred_labels_str_cos = [self.idx_to_fault.get(l, f"Unk_{l}") for l in y_classified_indices_np_cos]
+        cm_display_labels_cos = sorted(list(set(reference_fault_names_cos)))
 
-        conf_matrix_cosine_val = None
-        conf_matrix_cosine_val = confusion_matrix(true_labels_str_cosine, pred_labels_str_cosine,
-                                                  labels=display_labels_cm_cosine)
         configure_chinese_font()
         plt.figure(figsize=(10, 8))
-        sns.heatmap(conf_matrix_cosine_val, annot=True, fmt='d', cmap='Greens',
-                    xticklabels=display_labels_cm_cosine, yticklabels=display_labels_cm_cosine)
+        sns.heatmap(confusion_matrix(true_labels_str_cos, pred_labels_str_cos, labels=cm_display_labels_cos),
+                    annot=True, fmt='d', cmap='Greens',
+                    xticklabels=cm_display_labels_cos, yticklabels=cm_display_labels_cos)
         plt.xlabel('预测标签')
         plt.ylabel('真实标签')
-        plt.title(f'零样本学习混淆矩阵 (实时语义+余弦相似度, 准确率: {accuracy_cosine_val:.2f}%)')
+        plt.title(f'ZSL混淆矩阵 (SAE投影语义+余弦相似度, 准确率: {accuracy_cos:.2f}%)')
         plt.xticks(rotation=45, ha='right');
         plt.yticks(rotation=0)
         plt.tight_layout()
-        plt.savefig('compound_fault_confusion_matrix_zsl_cosine_realtime.png')
+        plt.savefig('compound_fault_cm_zsl_sae_cosine.png')
         plt.close()
-        print("混淆矩阵 (余弦相似度) 已保存至 'compound_fault_confusion_matrix_zsl_cosine_realtime.png'")
+        print("混淆矩阵 (SAE+余弦) 已保存至 'compound_fault_cm_zsl_sae_cosine.png'")
 
-        return accuracy_cosine_val, conf_matrix_cosine_val  # Return conf_matrix_cosine_val directly
+        return accuracy_cos, class_accuracy_cosine_results
 
     def visualize_semantic_space(self, data_dict, semantic_dict):
         """
-        可视化单一故障和复合故障在自编码器语义空间的分布
-        显示每类故障的所有样本点而不是仅显示中心点
+        可视化单一故障和复合故障在自编码器语义空间的分布 (AE latent space from FaultSemanticBuilder)
         """
-        print("\n==== 可视化AE语义空间分布 ====")
+        print("\n==== 可视化AE语义空间分布 (FaultSemanticBuilder的潜空间) ====")
 
-        # 准备单一故障数据
-        single_fault_types = ['normal', 'inner', 'outer', 'ball']
-        single_fault_indices = [self.fault_types[name] for name in single_fault_types]
-
-        # 准备复合故障数据
-        compound_fault_types = ['inner_outer', 'inner_ball', 'outer_ball', 'inner_outer_ball']
-        compound_fault_indices = [self.fault_types[name] for name in compound_fault_types]
-
-        # 获取训练数据和测试数据
-        X_train, y_train = data_dict['X_train'], data_dict['y_train']
-        X_test, y_test = data_dict['X_test'], data_dict['y_test']
-
-        # 为保证可视化效果，限制每类故障的样本数量
-        max_samples_per_class = 300
-
-        # 提取单一故障样本
-        single_fault_samples = []
-        single_fault_labels = []
-
-        for fault_idx in single_fault_indices:
-            mask = (y_train == fault_idx)
-            samples = X_train[mask]
-            if len(samples) > max_samples_per_class:
-                # 随机抽样以控制点数
-                indices = np.random.choice(len(samples), max_samples_per_class, replace=False)
-                samples = samples[indices]
-
-            if len(samples) > 0:
-                single_fault_samples.append(samples)
-                single_fault_labels.extend([fault_idx] * len(samples))
-
-        # 提取复合故障样本
-        compound_fault_samples = []
-        compound_fault_labels = []
-
-        for fault_idx in compound_fault_indices:
-            mask = (y_test == fault_idx)
-            samples = X_test[mask]
-            if len(samples) > max_samples_per_class:
-                # 随机抽样以控制点数
-                indices = np.random.choice(len(samples), max_samples_per_class, replace=False)
-                samples = samples[indices]
-
-            if len(samples) > 0:
-                compound_fault_samples.append(samples)
-                compound_fault_labels.extend([fault_idx] * len(samples))
-
-        # 准备所有数据用于AE编码
-        all_samples = np.vstack(
-            single_fault_samples + compound_fault_samples) if single_fault_samples and compound_fault_samples else None
-        all_labels = np.array(single_fault_labels + compound_fault_labels)
-
-        # 使用AE提取语义特征
-        self.semantic_builder.autoencoder.eval()
-        batch_size = 128
-        all_features = []
-
-        with torch.no_grad():
-            for i in range(0, len(all_samples), batch_size):
-                batch_x = torch.FloatTensor(all_samples[i:i + batch_size]).to(self.device)
-                latent = self.semantic_builder.autoencoder.encode(batch_x)
-                all_features.append(latent.cpu().numpy())
-
-        all_features = np.vstack(all_features)
-
-        # 确保提取的特征是有限的
+        all_features = self.semantic_builder.all_latent_features
+        all_labels = self.semantic_builder.all_latent_labels
         valid_indices = np.all(np.isfinite(all_features), axis=1)
         all_features = all_features[valid_indices]
         all_labels = all_labels[valid_indices]
+        max_samples_viz = 2000
+        if len(all_features) > max_samples_viz:
+            sample_indices = np.random.choice(len(all_features), max_samples_viz, replace=False)
+            all_features = all_features[sample_indices]
+            all_labels = all_labels[sample_indices]
 
-        if len(all_features) == 0:
-            print("错误: 所有提取的特征都包含非有限值")
-            return
+        pca = PCA(n_components=3)  # Ensure 3 components for 3D plot
+        features_reduced_pca = pca.fit_transform(all_features)
 
-        # 应用PCA降维用于可视化
-        from sklearn.decomposition import PCA
-        pca = PCA(n_components=3)
-        features_reduced = pca.fit_transform(all_features)
+        fault_names_pca = [self.idx_to_fault.get(label, f"Unknown_{label}") for label in all_labels]
+        fault_labels_unique_pca = sorted(list(set(fault_names_pca)))
 
-        # 可视化2D和3D投影
-        # 创建故障标签映射
-        fault_names = [self.idx_to_fault.get(label, f"Unknown_{label}") for label in all_labels]
-        fault_labels_unique = sorted(set(fault_names))
+        colors_pca = sns.color_palette('husl', n_colors=len(fault_labels_unique_pca))
+        color_map_pca = {fault: colors_pca[i] for i, fault in enumerate(fault_labels_unique_pca)}
+        marker_map_pca = {fault: 'o' if '_' not in fault else '^' for fault in fault_labels_unique_pca}
 
-        # 颜色映射和标记映射
-        colors = sns.color_palette('husl', n_colors=len(fault_labels_unique))
-        color_map = {fault: colors[i] for i, fault in enumerate(fault_labels_unique)}
-
-        # 单一故障和复合故障使用不同的标记
-        marker_map = {fault: 'o' if '_' not in fault else '^' for fault in fault_labels_unique}
-
-        # 配置字体
         configure_chinese_font()
 
-        # 2D可视化
+        # 2D PCA
         plt.figure(figsize=(12, 10))
-        for fault in fault_labels_unique:
-            mask = np.array(fault_names) == fault
-            plt.scatter(
-                features_reduced[mask, 0],
-                features_reduced[mask, 1],
-                c=[color_map[fault]],
-                marker=marker_map[fault],
-                label=fault,
-                alpha=0.7,
-                s=50 if '_' not in fault else 80
-            )
-
-        plt.title('AE语义空间的故障分布 (PCA 2D投影)')
-        plt.xlabel(f'主成分1 ({pca.explained_variance_ratio_[0]:.2%})')
-        plt.ylabel(f'主成分2 ({pca.explained_variance_ratio_[1]:.2%})')
+        for fault in fault_labels_unique_pca:
+            mask = np.array(fault_names_pca) == fault
+            plt.scatter(features_reduced_pca[mask, 0], features_reduced_pca[mask, 1],
+                        c=[color_map_pca[fault]], marker=marker_map_pca[fault], label=fault, alpha=0.6, s=40)
+        plt.title('AE潜语义空间 (PCA 2D)')
+        plt.xlabel(f'PCA1 ({pca.explained_variance_ratio_[0]:.2%})')
+        plt.ylabel(f'PCA2 ({pca.explained_variance_ratio_[1]:.2%})')
         plt.legend(loc='best', bbox_to_anchor=(1.01, 1), borderaxespad=0)
-        plt.grid(True, linestyle='--', alpha=0.7)
+        plt.grid(True, linestyle='--', alpha=0.7);
         plt.tight_layout()
-        plt.savefig('ae_semantic_space_distribution_2d.png')
+        plt.savefig('ae_latent_semantic_space_pca2d.png');
         plt.close()
 
-        # 3D可视化
+        # 3D PCA
         fig = plt.figure(figsize=(14, 12))
         ax = fig.add_subplot(111, projection='3d')
-
-        for fault in fault_labels_unique:
-            mask = np.array(fault_names) == fault
-            ax.scatter(
-                features_reduced[mask, 0],
-                features_reduced[mask, 1],
-                features_reduced[mask, 2],
-                c=[color_map[fault]],
-                marker=marker_map[fault],
-                label=fault,
-                alpha=0.7,
-                s=50 if '_' not in fault else 80
-            )
-
-        ax.set_title('AE语义空间的故障分布 (PCA 3D投影)')
-        ax.set_xlabel(f'主成分1 ({pca.explained_variance_ratio_[0]:.2%})')
-        ax.set_ylabel(f'主成分2 ({pca.explained_variance_ratio_[1]:.2%})')
-        ax.set_zlabel(f'主成分3 ({pca.explained_variance_ratio_[2]:.2%})')
+        for fault in fault_labels_unique_pca:
+            mask = np.array(fault_names_pca) == fault
+            ax.scatter(features_reduced_pca[mask, 0], features_reduced_pca[mask, 1], features_reduced_pca[mask, 2],
+                       c=[color_map_pca[fault]], marker=marker_map_pca[fault], label=fault, alpha=0.6, s=40)
+        ax.set_title('AE潜语义空间 (PCA 3D)')
+        ax.set_xlabel(f'PCA1 ({pca.explained_variance_ratio_[0]:.2%})')
+        ax.set_ylabel(f'PCA2 ({pca.explained_variance_ratio_[1]:.2%})')
+        ax.set_zlabel(f'PCA3 ({pca.explained_variance_ratio_[2]:.2%})')
         ax.legend(loc='best', bbox_to_anchor=(1.01, 1), borderaxespad=0)
-        plt.tight_layout()
-        plt.savefig('ae_semantic_space_distribution_3d.png')
+        plt.tight_layout();
+        plt.savefig('ae_latent_semantic_space_pca3d.png');
         plt.close()
+        tsne = TSNE(n_components=2, perplexity=min(30, len(all_features) - 1 if len(all_features) > 1 else 1),
+                    n_iter=300, random_state=42, learning_rate='auto', init='pca')  # Reduced n_iter for speed
+        if len(all_features) > 1:  # tSNE needs more than 1 sample
+            features_tsne = tsne.fit_transform(all_features)
+            plt.figure(figsize=(12, 10))
+            for fault in fault_labels_unique_pca:  # Use same labels and colors
+                mask = np.array(fault_names_pca) == fault
+                plt.scatter(features_tsne[mask, 0], features_tsne[mask, 1],
+                            c=[color_map_pca[fault]], marker=marker_map_pca[fault], label=fault, alpha=0.6, s=40)
+            plt.title('AE潜语义空间 (t-SNE 2D)')
+            plt.xlabel('t-SNE Dim 1');
+            plt.ylabel('t-SNE Dim 2')
+            plt.legend(loc='best', bbox_to_anchor=(1.01, 1), borderaxespad=0)
+            plt.grid(True, linestyle='--', alpha=0.7);
+            plt.tight_layout()
+            plt.savefig('ae_latent_semantic_space_tsne.png');
+            plt.close()
+            print("AE潜语义空间可视化图 (PCA 2D/3D, t-SNE 2D) 已保存。")
+        else:
+            print("样本过少，跳过AE潜语义空间t-SNE可视化。")
 
-        # 使用t-SNE进行更好的非线性降维可视化
-        tsne = TSNE(n_components=2, perplexity=30, n_iter=1000, random_state=42)
-        features_tsne = tsne.fit_transform(all_features)
-
-        plt.figure(figsize=(12, 10))
-        for fault in fault_labels_unique:
-            mask = np.array(fault_names) == fault
-            plt.scatter(
-                features_tsne[mask, 0],
-                features_tsne[mask, 1],
-                c=[color_map[fault]],
-                marker=marker_map[fault],
-                label=fault,
-                alpha=0.7,
-                s=50 if '_' not in fault else 80
-            )
-
-        plt.title('AE语义空间的故障分布 (t-SNE投影)')
-        plt.xlabel('t-SNE 维度1')
-        plt.ylabel('t-SNE 维度2')
-        plt.legend(loc='best', bbox_to_anchor=(1.01, 1), borderaxespad=0)
-        plt.grid(True, linestyle='--', alpha=0.7)
-        plt.tight_layout()
-        plt.savefig('ae_semantic_space_distribution_tsne.png')
-        plt.close()
-
-        print("t-SNE可视化图已保存")
-
-    def visualize_unified_feature_space(self, data_dict, semantic_dict, compound_projections,
-                                        max_samples_per_class=200):
+    def visualize_sae_semantic_space(self, data_dict, semantic_dict):
         """
-        在统一空间中可视化：
-        1. 复合故障投影后的语义特征
-        2. 单一故障经过双通道CNN提取的特征
-        3. 复合故障经过双通道CNN提取的特征
-        使用PCA和t-SNE进行降维可视化
+        可视化SAE投影后的融合语义空间。
+        - 输入: CNN特征 (X^S)
+        - 通过SAE投影: A_pred = SAE(X^S)
+        - 可选: 叠印目标融合语义 A_target
         """
-        print("\n==== 绘制统一特征空间分布图 ====")
+        print("\n==== 可视化SAE投影语义空间 ====")
 
+        self.cnn_model.eval()
+        self.sae_model.eval()
+        self.semantic_builder.autoencoder.eval()
+
+        X_train_signals, y_train_labels = data_dict['X_train'], data_dict['y_train']
+        X_test_signals, y_test_labels = data_dict['X_test'], data_dict['y_test']
+        max_samples_per_class_viz = 100
+
+        viz_signals_list = []
+        viz_labels_list = []
+
+        # Single faults from training set
+        for ft_idx in [self.fault_types[name] for name in self.single_fault_types_ordered]:
+            mask = y_train_labels == ft_idx
+            signals = X_train_signals[mask][:max_samples_per_class_viz]
+            labels = y_train_labels[mask][:max_samples_per_class_viz]
+            if len(signals) > 0:
+                viz_signals_list.append(signals)
+                viz_labels_list.append(labels)
+
+        # Compound faults from test set
+        for ft_idx in [self.fault_types[name] for name in self.compound_fault_types]:
+            mask = y_test_labels == ft_idx
+            signals = X_test_signals[mask][:max_samples_per_class_viz]
+            labels = y_test_labels[mask][:max_samples_per_class_viz]
+            if len(signals) > 0:
+                viz_signals_list.append(signals)
+                viz_labels_list.append(labels)
+
+        if not viz_signals_list:
+            print("SAE可视化：无可用信号数据。")
+            return
+
+        X_viz_signals = np.vstack(viz_signals_list)
+        y_viz_labels = np.concatenate(viz_labels_list)
+        sae_projected_semantics_list = []
+        with torch.no_grad():
+            bs = self.batch_size
+            for i in range(0, len(X_viz_signals), bs):
+                batch_sig = torch.FloatTensor(X_viz_signals[i:i + bs]).to(self.device)
+                ae_in = batch_sig.squeeze(1) if batch_sig.dim() == 3 and batch_sig.shape[1] == 1 else batch_sig
+                if ae_in.dim() != 2 or ae_in.shape[1] != self.semantic_builder.autoencoder.input_length: continue
+
+                ae_sem_for_cnn = self.semantic_builder.autoencoder.encode(ae_in)
+                cnn_feats = self.cnn_model(batch_sig, ae_sem_for_cnn, return_features=True)
+                sae_proj_sem = self.sae_model(cnn_feats)
+                sae_projected_semantics_list.append(sae_proj_sem.cpu().numpy())
+
+
+        sae_projected_semantics_np = np.vstack(sae_projected_semantics_list)
+        target_fused_semantics_map = semantic_dict.get('fused_semantics', {})
+        target_semantics_for_viz_list = []
+        target_labels_for_viz_list = []
+        for ft_name, ft_vec in target_fused_semantics_map.items():
+            if ft_vec is not None and np.all(np.isfinite(ft_vec)):
+                target_semantics_for_viz_list.append(ft_vec)
+                target_labels_for_viz_list.append(self.fault_types[ft_name])
+        target_semantics_for_viz_np = np.array(target_semantics_for_viz_list)
+        combined_semantics_for_dim_reduction = np.vstack([sae_projected_semantics_np, target_semantics_for_viz_np])
+
+        pca_sae = PCA(n_components=3)
+        reduced_combined_pca = pca_sae.fit_transform(combined_semantics_for_dim_reduction)
+
+        num_projected = len(sae_projected_semantics_np)
+        reduced_projected_pca = reduced_combined_pca[:num_projected]
+        reduced_target_pca = reduced_combined_pca[num_projected:]
+
+        # Plotting
         configure_chinese_font()
+        fault_names_viz = [self.idx_to_fault.get(lbl, f"Unk_{lbl}") for lbl in y_viz_labels]
+        unique_fault_names_viz = sorted(list(set(fault_names_viz)))
 
-        # === 1. 准备复合故障投影特征 ===
-        print("1. 准备复合故障投影特征...")
-        compound_projection_features = []
-        compound_projection_labels = []
-        compound_projection_names = []
+        colors_viz = sns.color_palette('tab10', n_colors=len(unique_fault_names_viz))
+        color_map_viz = {name: colors_viz[i] for i, name in enumerate(unique_fault_names_viz)}
 
-        for fault_name, projection in compound_projections.items():
-            if np.all(np.isfinite(projection)):
-                compound_projection_features.append(projection)
-                compound_projection_labels.append(self.fault_types[fault_name])
-                compound_projection_names.append(f"{fault_name}_projection")
+        # 2D PCA plot for SAE projected semantics
+        plt.figure(figsize=(13, 10))
+        for name in unique_fault_names_viz:
+            mask = np.array(fault_names_viz) == name
+            plt.scatter(reduced_projected_pca[mask, 0], reduced_projected_pca[mask, 1],
+                        c=[color_map_viz[name]], label=f"Proj: {name}", alpha=0.7, s=50,
+                        marker='o' if '_' not in name else 's')
 
-        compound_projection_features = np.array(compound_projection_features)
-        print(f"   - 复合故障投影: {len(compound_projection_features)} 个")
+        # Overlay target semantics
+        target_fault_names_viz = [self.idx_to_fault.get(lbl, f"Unk_{lbl}") for lbl in target_labels_for_viz_list]
+        for i, name in enumerate(target_fault_names_viz):
+            if name in color_map_viz:  # Only plot if it's one of the visualized fault types
+                plt.scatter(reduced_target_pca[i, 0], reduced_target_pca[i, 1],
+                            c=[color_map_viz[name]],
+                            label=f"Target: {name}" if name not in plt.gca().get_legend_handles_labels()[1] else None,
+                            edgecolors='k', marker='X', s=150, linewidths=1.5)
 
-        # === 2. 提取单一故障的CNN特征 ===
-        print("2. 提取单一故障CNN特征...")
-        X_train, y_train = data_dict['X_train'], data_dict['y_train']
-        single_fault_indices = [self.fault_types[name] for name in ['normal', 'inner', 'outer', 'ball']]
+        plt.title('SAE投影语义空间 vs 目标语义 (PCA 2D)')
+        plt.xlabel(f'PCA1 ({pca_sae.explained_variance_ratio_[0]:.2%})')
+        plt.ylabel(f'PCA2 ({pca_sae.explained_variance_ratio_[1]:.2%})')
+        plt.legend(loc='center left', bbox_to_anchor=(1.01, 0.5), ncol=1)
+        plt.grid(True, linestyle='--', alpha=0.6);
+        plt.tight_layout(rect=[0, 0, 0.85, 1])  # Adjust for legend
+        plt.savefig('sae_projected_vs_target_semantic_pca2d.png');
+        plt.close()
 
-        single_fault_features = []
-        single_fault_labels = []
-        single_fault_names = []
+        # t-SNE
+        tsne_sae_perplexity = min(30, combined_semantics_for_dim_reduction.shape[0] - 1)
+        if tsne_sae_perplexity > 0:
+            tsne_sae = TSNE(n_components=2, perplexity=tsne_sae_perplexity, n_iter=300, random_state=42,
+                            learning_rate='auto', init='pca')
+            reduced_combined_tsne = tsne_sae.fit_transform(combined_semantics_for_dim_reduction)
+            reduced_projected_tsne = reduced_combined_tsne[:num_projected]
+            reduced_target_tsne = reduced_combined_tsne[num_projected:]
+
+            plt.figure(figsize=(13, 10))
+            for name in unique_fault_names_viz:
+                mask = np.array(fault_names_viz) == name
+                plt.scatter(reduced_projected_tsne[mask, 0], reduced_projected_tsne[mask, 1],
+                            c=[color_map_viz[name]], label=f"Proj: {name}", alpha=0.7, s=50,
+                            marker='o' if '_' not in name else 's')
+            for i, name in enumerate(target_fault_names_viz):
+                if name in color_map_viz:
+                    plt.scatter(reduced_target_tsne[i, 0], reduced_target_tsne[i, 1],
+                                c=[color_map_viz[name]],
+                                label=f"Target: {name}" if name not in plt.gca().get_legend_handles_labels()[
+                                    1] else None,
+                                edgecolors='k', marker='X', s=150, linewidths=1.5)
+            plt.title('SAE投影语义空间 vs 目标语义 (t-SNE 2D)')
+            plt.xlabel('t-SNE Dim 1');
+            plt.ylabel('t-SNE Dim 2')
+            plt.legend(loc='center left', bbox_to_anchor=(1.01, 0.5), ncol=1)
+            plt.grid(True, linestyle='--', alpha=0.6);
+            plt.tight_layout(rect=[0, 0, 0.85, 1])
+            plt.savefig('sae_projected_vs_target_semantic_tsne.png');
+            plt.close()
+            print("SAE投影语义空间可视化图 (PCA & t-SNE) 已保存。")
+        else:
+            print("样本过少，跳过SAE投影语义空间t-SNE可视化。")
+
+    def visualize_cnn_feature_distribution(self, data_dict, max_samples_per_class=200):
+        """
+        可视化CNN模型提取的特征分布 (SAE的输入)
+        """
+        print("\n==== 可视化CNN特征空间分布 (SAE输入) ====")
+
 
         self.cnn_model.eval()
         self.semantic_builder.autoencoder.eval()
 
-        # 为每个单一故障类型提取特征
-        for fault_idx in single_fault_indices:
-            mask = (y_train == fault_idx)
-            fault_samples = X_train[mask]
-
-            if len(fault_samples) > max_samples_per_class:
-                indices = np.random.choice(len(fault_samples), max_samples_per_class, replace=False)
-                fault_samples = fault_samples[indices]
-
-            if len(fault_samples) == 0:
-                continue
-
-            fault_name = self.idx_to_fault[fault_idx]
-            batch_size = 64
-
-            with torch.no_grad():
-                for i in range(0, len(fault_samples), batch_size):
-                    batch_x = torch.FloatTensor(fault_samples[i:i + batch_size]).to(self.device)
-
-                    # 使用AE提取实时语义
-                    ae_input = batch_x.squeeze(1) if batch_x.dim() == 3 else batch_x
-                    real_time_semantics = self.semantic_builder.autoencoder.encode(ae_input)
-
-                    # 通过双通道CNN提取特征
-                    cnn_features = self.cnn_model(batch_x, real_time_semantics, return_features=True)
-
-                    single_fault_features.extend(cnn_features.cpu().numpy())
-                    single_fault_labels.extend([fault_idx] * len(cnn_features))
-                    single_fault_names.extend([f"{fault_name}_real"] * len(cnn_features))
-
-        single_fault_features = np.array(single_fault_features)
-        single_fault_labels = np.array(single_fault_labels)
-        print(f"   - 单一故障CNN特征: {len(single_fault_features)} 个")
-
-        # === 3. 提取复合故障的CNN特征 ===
-        print("3. 提取复合故障CNN特征...")
+        X_train, y_train = data_dict['X_train'], data_dict['y_train']
         X_test, y_test = data_dict['X_test'], data_dict['y_test']
-        compound_fault_indices = [self.fault_types[name] for name in compound_projections.keys()]
 
-        compound_fault_features = []
-        compound_fault_labels = []
-        compound_fault_names = []
+        single_idxs = [self.fault_types[k] for k in self.single_fault_types_ordered]
+        comp_idxs = [self.fault_types[k] for k in self.compound_fault_types]
 
-        for fault_idx in compound_fault_indices:
-            mask = (y_test == fault_idx)
-            fault_samples = X_test[mask]
+        def sample_by_label(X, y, label_list, max_s):
+            samples_l, labels_l = [], []
+            for lbl_idx in label_list:
+                idxs = np.where(y == lbl_idx)[0]
+                if len(idxs) == 0: continue
+                choose = np.random.choice(idxs, min(len(idxs), max_s), replace=False)
+                if X[choose].shape[0] > 0:  # Ensure something is chosen
+                    samples_l.append(X[choose])
+                    labels_l.extend([lbl_idx] * len(choose))
+            # Check if samples_l is empty before vstack
+            return np.vstack(samples_l) if samples_l else np.empty((0, X.shape[1])), np.array(labels_l)
 
-            if len(fault_samples) > max_samples_per_class:
-                indices = np.random.choice(len(fault_samples), max_samples_per_class, replace=False)
-                fault_samples = fault_samples[indices]
+        X_single, y_single = sample_by_label(X_train, y_train, single_idxs, max_samples_per_class)
+        X_comp, y_comp = sample_by_label(X_test, y_test, comp_idxs, max_samples_per_class)
 
-            if len(fault_samples) == 0:
-                continue
 
-            fault_name = self.idx_to_fault[fault_idx]
+        X_all_cnn = []
+        y_all_cnn = []
+        if X_single.shape[0] > 0:
+            X_all_cnn.append(X_single)
+            y_all_cnn.append(y_single)
+        if X_comp.shape[0] > 0:
+            X_all_cnn.append(X_comp)
+            y_all_cnn.append(y_comp)
 
-            with torch.no_grad():
-                for i in range(0, len(fault_samples), batch_size):
-                    batch_x = torch.FloatTensor(fault_samples[i:i + batch_size]).to(self.device)
 
-                    # 使用AE提取实时语义
-                    ae_input = batch_x.squeeze(1) if batch_x.dim() == 3 else batch_x
-                    real_time_semantics = self.semantic_builder.autoencoder.encode(ae_input)
 
-                    # 通过双通道CNN提取特征
-                    cnn_features = self.cnn_model(batch_x, real_time_semantics, return_features=True)
+        X_all_cnn = np.vstack(X_all_cnn)
+        y_all_cnn = np.concatenate(y_all_cnn)
 
-                    compound_fault_features.extend(cnn_features.cpu().numpy())
-                    compound_fault_labels.extend([fault_idx] * len(cnn_features))
-                    compound_fault_names.extend([f"{fault_name}_real"] * len(cnn_features))
+        names_all_cnn = [self.idx_to_fault.get(i, f"Unk_{i}") for i in y_all_cnn]
 
-        compound_fault_features = np.array(compound_fault_features)
-        compound_fault_labels = np.array(compound_fault_labels)
-        print(f"   - 复合故障CNN特征: {len(compound_fault_features)} 个")
+        cnn_features_extracted = []
+        batch_sz_cnn_viz = self.batch_size
+        with torch.no_grad():
+            for i in range(0, len(X_all_cnn), batch_sz_cnn_viz):
+                xbatch_sig = torch.FloatTensor(X_all_cnn[i:i + batch_sz_cnn_viz]).to(self.device)
+                ae_in_cnn = xbatch_sig.squeeze(1) if xbatch_sig.dim() == 3 and xbatch_sig.shape[1] == 1 else xbatch_sig
+                if ae_in_cnn.dim() != 2 or ae_in_cnn.shape[
+                    1] != self.semantic_builder.autoencoder.input_length: continue
 
-        # === 4. 合并所有特征 ===
-        print("4. 合并所有特征进行统一可视化...")
-        all_features = np.vstack([
-            compound_projection_features,  # 投影语义
-            single_fault_features,  # 单一故障CNN特征
-            compound_fault_features  # 复合故障CNN特征
-        ])
+                sem_for_cnn = self.semantic_builder.autoencoder.encode(ae_in_cnn)
+                feat_cnn = self.cnn_model(xbatch_sig, sem_for_cnn, return_features=True)
+                cnn_features_extracted.append(feat_cnn.cpu().numpy())
 
-        all_labels = np.concatenate([
-            compound_projection_labels,  # 投影标签
-            single_fault_labels,  # 单一故障标签
-            compound_fault_labels  # 复合故障标签
-        ])
 
-        all_names = (compound_projection_names +
-                     single_fault_names +
-                     compound_fault_names)
+        feats_cnn = np.vstack(cnn_features_extracted)
 
-        all_types = (['projection'] * len(compound_projection_features) +
-                     ['single_real'] * len(single_fault_features) +
-                     ['compound_real'] * len(compound_fault_features))
+        configure_chinese_font()
+        palette_cnn = sns.color_palette('Spectral', n_colors=len(set(names_all_cnn)))  # Changed palette
 
-        print(f"   - 总特征数: {len(all_features)}")
-        print(f"   - 投影特征: {len(compound_projection_features)}")
-        print(f"   - 单一故障实际特征: {len(single_fault_features)}")
-        print(f"   - 复合故障实际特征: {len(compound_fault_features)}")
+        # PCA 2D
+        pca_cnn = PCA(n_components=2)
+        pca2_cnn = pca_cnn.fit_transform(feats_cnn)
+        plt.figure(figsize=(10, 8))
+        sns.scatterplot(x=pca2_cnn[:, 0], y=pca2_cnn[:, 1], hue=names_all_cnn,
+                        palette=palette_cnn, s=60, alpha=0.8, style=names_all_cnn,
+                        markers={name: ('o' if '_' not in name else '^') for name in set(names_all_cnn)})
+        plt.title('CNN 特征空间 PCA 2D 投影 (SAE输入)')
+        plt.legend(loc='best', bbox_to_anchor=(1, 1));
+        plt.tight_layout()
+        plt.savefig('cnn_feature_space_pca2d_sae_input.png');
+        plt.close()
 
-        # === 5. PCA降维可视化 ===
-        print("5. 进行PCA降维...")
-        from sklearn.decomposition import PCA
-
-        # 2D PCA
-        pca_2d = PCA(n_components=2)
-        features_pca_2d = pca_2d.fit_transform(all_features)
-
-        # 3D PCA
-        pca_3d = PCA(n_components=3)
-        features_pca_3d = pca_3d.fit_transform(all_features)
-
-        # === 6. t-SNE降维可视化 ===
-        print("6. 进行t-SNE降维...")
-        from sklearn.manifold import TSNE
-
-        # 为了t-SNE性能，如果数据量太大就采样
-        if len(all_features) > 2000:
-            sample_indices = np.random.choice(len(all_features), 2000, replace=False)
-            tsne_features = all_features[sample_indices]
-            tsne_labels = all_labels[sample_indices]
-            tsne_names = [all_names[i] for i in sample_indices]
-            tsne_types = [all_types[i] for i in sample_indices]
+        # t-SNE 2D
+        tsne_cnn_perplexity = min(30, feats_cnn.shape[0] - 1 if feats_cnn.shape[0] > 1 else 1)
+        if tsne_cnn_perplexity > 0:
+            tsne_cnn = TSNE(n_components=2, perplexity=tsne_cnn_perplexity, n_iter=300, random_state=42,
+                            learning_rate='auto', init='pca')
+            tsne2_cnn = tsne_cnn.fit_transform(feats_cnn)
+            plt.figure(figsize=(10, 8))
+            sns.scatterplot(x=tsne2_cnn[:, 0], y=tsne2_cnn[:, 1], hue=names_all_cnn,
+                            palette=palette_cnn, s=60, alpha=0.8, style=names_all_cnn,
+                            markers={name: ('o' if '_' not in name else '^') for name in set(names_all_cnn)})
+            plt.title('CNN 特征空间 t-SNE 2D 投影 (SAE输入)')
+            plt.legend(loc='best', bbox_to_anchor=(1, 1));
+            plt.tight_layout()
+            plt.savefig('cnn_feature_space_tsne2d_sae_input.png');
+            plt.close()
+            print("CNN 特征空间可视化 (SAE输入) 完成 (PCA & t-SNE)。")
         else:
-            tsne_features = all_features
-            tsne_labels = all_labels
-            tsne_names = all_names
-            tsne_types = all_types
+            print("CNN特征可视化：样本过少，跳过t-SNE。")
 
-        tsne = TSNE(n_components=2, perplexity=min(30, len(tsne_features) - 1),
-                    n_iter=1000, random_state=42)
-        features_tsne = tsne.fit_transform(tsne_features)
+    def run_pipeline(self):
+        """基于语义自编码器(SAE)的零样本复合故障诊断流水线"""
+        start_time = time.time()
+        print("\n==== 步骤1: 数据加载 ====")
+        data_dict = self.load_data()
 
-        # === 7. 创建颜色和标记映射 ===
-        unique_fault_names = sorted(set([self.idx_to_fault[label] for label in set(all_labels)]))
-        colors = sns.color_palette('tab10', n_colors=len(unique_fault_names))
-        color_map = {name: colors[i] for i, name in enumerate(unique_fault_names)}
+        print("\n==== 步骤2: 语义构建 (AE训练和融合语义生成) ====")
+        semantic_dict = self.build_semantics(data_dict)
 
-        # 不同类型使用不同标记
-        marker_map = {
-            'projection': 's',  # 方块 - 投影
-            'single_real': 'o',  # 圆圈 - 单一故障实际
-            'compound_real': '^'  # 三角 - 复合故障实际
-        }
+        self.actual_ae_latent_dim = self.semantic_builder.actual_latent_dim
+        self.fused_semantic_dim = self.semantic_builder.knowledge_dim + self.actual_ae_latent_dim
 
-        size_map = {
-            'projection': 120,  # 投影点更大
-            'single_real': 30,  # 单一故障点
-            'compound_real': 50  # 复合故障点
-        }
+        self.visualize_semantic_space(data_dict, semantic_dict)
 
-        # === 8. 绘制PCA 2D图 ===
-        plt.figure(figsize=(16, 12))
+        print("\n==== 步骤3: 初始化并训练CNN模型 (带FiLM调制) ====")
 
-        for fault_name in unique_fault_names:
-            for data_type in ['projection', 'single_real', 'compound_real']:
-                mask = np.array([(self.idx_to_fault[all_labels[i]] == fault_name and
-                                  all_types[i] == data_type) for i in range(len(all_features))])
-
-                if np.any(mask):
-                    plt.scatter(features_pca_2d[mask, 0], features_pca_2d[mask, 1],
-                                c=[color_map[fault_name]], marker=marker_map[data_type],
-                                s=size_map[data_type], alpha=0.7,
-                                label=f"{fault_name}_{data_type}",
-                                edgecolors='black' if data_type == 'projection' else 'none',
-                                linewidth=1 if data_type == 'projection' else 0)
-
-        plt.title(f'统一特征空间分布 - PCA 2D\n'
-                  f'解释方差: PC1={pca_2d.explained_variance_ratio_[0]:.2%}, '
-                  f'PC2={pca_2d.explained_variance_ratio_[1]:.2%}')
-        plt.xlabel(f'主成分1 ({pca_2d.explained_variance_ratio_[0]:.2%})')
-        plt.ylabel(f'主成分2 ({pca_2d.explained_variance_ratio_[1]:.2%})')
-        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
-        plt.grid(True, alpha=0.3)
-        plt.tight_layout()
-        plt.savefig('unified_feature_space_pca_2d.png', dpi=300, bbox_inches='tight')
-        plt.close()
-
-        # === 9. 绘制PCA 3D图 ===
-        fig = plt.figure(figsize=(16, 12))
-        ax = fig.add_subplot(111, projection='3d')
-
-        for fault_name in unique_fault_names:
-            for data_type in ['projection', 'single_real', 'compound_real']:
-                mask = np.array([(self.idx_to_fault[all_labels[i]] == fault_name and
-                                  all_types[i] == data_type) for i in range(len(all_features))])
-
-                if np.any(mask):
-                    ax.scatter(features_pca_3d[mask, 0], features_pca_3d[mask, 1], features_pca_3d[mask, 2],
-                               c=[color_map[fault_name]], marker=marker_map[data_type],
-                               s=size_map[data_type], alpha=0.7,
-                               label=f"{fault_name}_{data_type}",
-                               edgecolors='black' if data_type == 'projection' else 'none',
-                               linewidth=1 if data_type == 'projection' else 0)
-
-        ax.set_title(f'统一特征空间分布 - PCA 3D\n'
-                     f'解释方差: PC1={pca_3d.explained_variance_ratio_[0]:.2%}, '
-                     f'PC2={pca_3d.explained_variance_ratio_[1]:.2%}, '
-                     f'PC3={pca_3d.explained_variance_ratio_[2]:.2%}')
-        ax.set_xlabel(f'主成分1 ({pca_3d.explained_variance_ratio_[0]:.2%})')
-        ax.set_ylabel(f'主成分2 ({pca_3d.explained_variance_ratio_[1]:.2%})')
-        ax.set_zlabel(f'主成分3 ({pca_3d.explained_variance_ratio_[2]:.2%})')
-        ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
-        plt.tight_layout()
-        plt.savefig('unified_feature_space_pca_3d.png', dpi=300, bbox_inches='tight')
-        plt.close()
-
-        # === 10. 绘制t-SNE图 ===
-        plt.figure(figsize=(16, 12))
-
-        for fault_name in unique_fault_names:
-            for data_type in ['projection', 'single_real', 'compound_real']:
-                mask = np.array([(self.idx_to_fault[tsne_labels[i]] == fault_name and
-                                  tsne_types[i] == data_type) for i in range(len(tsne_features))])
-
-                if np.any(mask):
-                    plt.scatter(features_tsne[mask, 0], features_tsne[mask, 1],
-                                c=[color_map[fault_name]], marker=marker_map[data_type],
-                                s=size_map[data_type], alpha=0.7,
-                                label=f"{fault_name}_{data_type}",
-                                edgecolors='black' if data_type == 'projection' else 'none',
-                                linewidth=1 if data_type == 'projection' else 0)
-
-        plt.title('统一特征空间分布 - t-SNE 2D\n'
-                  '方块=投影语义, 圆圈=单一故障实际, 三角=复合故障实际')
-        plt.xlabel('t-SNE 维度1')
-        plt.ylabel('t-SNE 维度2')
-        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
-        plt.grid(True, alpha=0.3)
-        plt.tight_layout()
-        plt.savefig('unified_feature_space_tsne_2d.png', dpi=300, bbox_inches='tight')
-        plt.close()
-
-        # === 11. 计算投影质量评估 ===
-        print("\n7. 计算投影质量评估...")
-        projection_quality_results = self._evaluate_projection_quality(
-            compound_projection_features, compound_fault_features,
-            compound_projection_labels, compound_fault_labels
+        self.cnn_model = self.train_ae_data_semantic_cnn(
+            data_dict=data_dict,
+            semantic_dict=semantic_dict,
+            epochs=CNN_EPOCHS,
+            batch_size=self.batch_size,  # Use class batch_size
+            lr=CNN_LR
         )
 
-        # === 12. 绘制分离度分析图 ===
-        self._plot_separation_analysis(all_features, all_labels, all_types, color_map)
+        self.visualize_cnn_feature_distribution(data_dict)
 
-        print(f"\n可视化完成！生成的图像文件:")
-        print(f"- unified_feature_space_pca_2d.png")
-        print(f"- unified_feature_space_pca_3d.png")
-        print(f"- unified_feature_space_tsne_2d.png")
-        print(f"- projection_quality_analysis.png")
-        print(f"- feature_separation_analysis.png")
+        print("\n==== 步骤4: 训练语义自编码器 (SAE) ====")
+        sae_train_success = self.train_semantic_autoencoder(
+            data_dict=data_dict,
+            semantic_dict=semantic_dict,
+            epochs=SAE_EPOCHS,
+            lr=SAE_LR
 
-        return projection_quality_results
+        )
+        self.visualize_sae_semantic_space(data_dict, semantic_dict)
 
-    def _evaluate_projection_quality(self, projection_features, real_features,
-                                     projection_labels, real_labels):
-        """评估投影质量"""
-        quality_results = {}
+        print("\n==== 步骤5: 获取复合故障的目标融合语义 (用于ZSL评估) ====")
+        # target_compound_semantics here will still be the fused ones for direct comparison,
+        # but the inference logic in evaluation functions will use the AttributeMapper
+        # with dynamic HF/LF values.
+        target_compound_semantics = semantic_dict.get('fused_semantics')
+        if not target_compound_semantics:
+            print("未能获取复合故障的目标语义，无法进行ZSL评估，终止流水线。")
+            return 0.0
 
-        unique_labels = set(projection_labels) & set(real_labels)
+        print("\n==== 步骤6: 零样本学习评估 ====")
+        print("--- 评估方法1: SAE投影语义 + PCA降维 + 欧氏距离 (使用Mapper动态生成候选语义) ---")
+        accuracy_pca, _ = self.evaluate_zero_shot_with_pca(
+            data_dict,
+            target_compound_semantics,  # Pass for list of compound names and overall structure
+            pca_components=min(3, self.fused_semantic_dim)
+        )
 
-        for label in unique_labels:
-            proj_mask = projection_labels == label
-            real_mask = real_labels == label
+        print("\n--- 评估方法2: SAE投影语义 + 原始融合语义空间 + 余弦相似度 (使用Mapper动态生成候选语义) ---")
+        accuracy_cosine, _ = self.evaluate_zero_shot_with_cosine_similarity(
+            data_dict,
+            target_compound_semantics  # Pass for list of compound names and overall structure
+        )
+        final_accuracy_to_report = accuracy_pca
 
-            if np.any(proj_mask) and np.any(real_mask):
-                proj_feat = projection_features[proj_mask]
-                real_feat = real_features[real_mask]
+        end_time = time.time()
+        print(f"\n=== 流水线在 {(end_time - start_time) / 60:.2f} 分钟内完成 ===")
+        print(f"零样本学习准确率 (PCA方法, 语义空间): {accuracy_pca:.2f}%")
+        print(f"零样本学习准确率 (余弦相似度方法, 语义空间): {accuracy_cosine:.2f}%")
 
-                # 计算投影中心与实际特征中心的距离
-                proj_center = np.mean(proj_feat, axis=0)
-                real_center = np.mean(real_feat, axis=0)
-                center_distance = np.linalg.norm(proj_center - real_center)
+        return final_accuracy_to_report
 
-                # 计算余弦相似度
-                cosine_sim = np.dot(proj_center, real_center) / (
-                        np.linalg.norm(proj_center) * np.linalg.norm(real_center) + 1e-8)
 
-                fault_name = self.idx_to_fault[label]
-                quality_results[fault_name] = {
-                    'center_distance': center_distance,
-                    'cosine_similarity': cosine_sim,
-                    'proj_samples': len(proj_feat),
-                    'real_samples': len(real_feat)
-                }
-
-        # 绘制质量评估图
-        plt.figure(figsize=(12, 8))
-
-        fault_names = list(quality_results.keys())
-        center_distances = [quality_results[name]['center_distance'] for name in fault_names]
-        cosine_sims = [quality_results[name]['cosine_similarity'] for name in fault_names]
-
-        x = np.arange(len(fault_names))
-        width = 0.35
-
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
-
-        # 中心距离
-        bars1 = ax1.bar(x, center_distances, width, alpha=0.8, color='steelblue')
-        ax1.set_ylabel('中心距离')
-        ax1.set_title('投影质量评估 - 投影中心与实际特征中心的距离')
-        ax1.set_xticks(x)
-        ax1.set_xticklabels(fault_names, rotation=45)
-        ax1.grid(True, alpha=0.3)
-
-        # 添加数值标签
-        for bar in bars1:
-            height = bar.get_height()
-            ax1.text(bar.get_x() + bar.get_width() / 2., height,
-                     f'{height:.3f}', ha='center', va='bottom')
-
-        # 余弦相似度
-        bars2 = ax2.bar(x, cosine_sims, width, alpha=0.8, color='coral')
-        ax2.set_ylabel('余弦相似度')
-        ax2.set_title('投影质量评估 - 投影中心与实际特征中心的余弦相似度')
-        ax2.set_xticks(x)
-        ax2.set_xticklabels(fault_names, rotation=45)
-        ax2.grid(True, alpha=0.3)
-        ax2.set_ylim(0, 1)
-
-        # 添加数值标签
-        for bar in bars2:
-            height = bar.get_height()
-            ax2.text(bar.get_x() + bar.get_width() / 2., height,
-                     f'{height:.3f}', ha='center', va='bottom')
-
-        plt.tight_layout()
-        plt.savefig('projection_quality_analysis.png', dpi=300, bbox_inches='tight')
-        plt.close()
-
-        print("\n投影质量评估结果:")
-        for fault_name, metrics in quality_results.items():
-            print(f"{fault_name}:")
-            print(f"  中心距离: {metrics['center_distance']:.4f}")
-            print(f"  余弦相似度: {metrics['cosine_similarity']:.4f}")
-            print(f"  投影样本数: {metrics['proj_samples']}")
-            print(f"  实际样本数: {metrics['real_samples']}")
-
-        return quality_results
-
-    def _plot_separation_analysis(self, all_features, all_labels, all_types, color_map):
-        """绘制特征分离度分析"""
-        from scipy.spatial.distance import pdist, squareform
-
-        # 计算类内和类间距离
-        unique_labels = np.unique(all_labels)
-        intra_class_distances = {}
-        inter_class_distances = {}
-
-        for label in unique_labels:
-            mask = all_labels == label
-            class_features = all_features[mask]
-
-            if len(class_features) > 1:
-                # 类内距离
-                intra_dist = pdist(class_features)
-                intra_class_distances[self.idx_to_fault[label]] = np.mean(intra_dist)
-
-        # 计算类间距离（中心点之间）
-        class_centers = {}
-        for label in unique_labels:
-            mask = all_labels == label
-            class_centers[label] = np.mean(all_features[mask], axis=0)
-
-        for i, label1 in enumerate(unique_labels):
-            for label2 in unique_labels[i + 1:]:
-                dist = np.linalg.norm(class_centers[label1] - class_centers[label2])
-                pair_name = f"{self.idx_to_fault[label1]}-{self.idx_to_fault[label2]}"
-                inter_class_distances[pair_name] = dist
-
-        # 绘制分离度分析图
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
-
-        # 类内距离
-        if intra_class_distances:
-            names = list(intra_class_distances.keys())
-            values = list(intra_class_distances.values())
-            bars1 = ax1.bar(names, values, alpha=0.7, color='lightblue')
-            ax1.set_title('类内平均距离（越小越好）')
-            ax1.set_ylabel('平均距离')
-            ax1.tick_params(axis='x', rotation=45)
-            ax1.grid(True, alpha=0.3)
-
-            for bar in bars1:
-                height = bar.get_height()
-                ax1.text(bar.get_x() + bar.get_width() / 2., height,
-                         f'{height:.2f}', ha='center', va='bottom')
-
-        # 类间距离
-        if inter_class_distances:
-            names = list(inter_class_distances.keys())
-            values = list(inter_class_distances.values())
-            bars2 = ax2.bar(range(len(names)), values, alpha=0.7, color='lightcoral')
-            ax2.set_title('类间中心距离（越大越好）')
-            ax2.set_ylabel('中心距离')
-            ax2.set_xticks(range(len(names)))
-            ax2.set_xticklabels(names, rotation=45, ha='right')
-            ax2.grid(True, alpha=0.3)
-
-            for bar in bars2:
-                height = bar.get_height()
-                ax2.text(bar.get_x() + bar.get_width() / 2., height,
-                         f'{height:.2f}', ha='center', va='bottom')
-
-        plt.tight_layout()
-        plt.savefig('feature_separation_analysis.png', dpi=300, bbox_inches='tight')
-        plt.close()
 if __name__ == "__main__":
     set_seed(42)
-    data_path = "E:/研究生/CNN/HDU Bearing Dataset"
+    data_path = "E:/研究生/CNN/HDU600-800"
+
     if not os.path.isdir(data_path):
-        print(f"E: Data directory not found: {data_path}")
-    else:
+        if data_path == "./HDU600D" and not os.path.exists("./HDU600D"):
+            os.makedirs("./HDU600D", exist_ok=True)
+            dummy_data = {'normal_data': np.random.rand(100000)}
+            sio.savemat("./HDU600D/normal.mat", dummy_data)
+
+    if os.path.isdir(data_path):
         fault_diagnosis = ZeroShotCompoundFaultDiagnosis(
             data_path=data_path,
             sample_length=SEGMENT_LENGTH,
-            latent_dim=AE_LATENT_DIM,
-            batch_size=DEFAULT_BATCH_SIZE
+            latent_dim=AE_LATENT_DIM,  # AE's latent dim
+            batch_size=DEFAULT_BATCH_SIZE,
+            sae_mu=SAE_MU
         )
         final_accuracy = fault_diagnosis.run_pipeline()
-        print(f"\n>>> Final ZSL Accuracy: {final_accuracy:.2f}% <<<")
+        print(f"\n>>> 最终零样本诊断准确率 (基于PCA方法报告): {final_accuracy:.2f}% <<<")
+    else:
+        print("由于数据目录问题，流水线未运行。")
