@@ -32,7 +32,7 @@ if STEP < 1: STEP = 1
 DEFAULT_WAVELET = 'db4'
 DEFAULT_WAVELET_LEVEL = 3
 AE_LATENT_DIM = 64
-AE_EPOCHS = 50
+AE_EPOCHS = 30
 AE_LR = 0.001
 AE_BATCH_SIZE = 64
 AE_CONTRASTIVE_WEIGHT = 1.2
@@ -103,349 +103,6 @@ def create_segments(signal_data, segment_length, step):
     return np.array(segments, dtype=np.float32) if segments else np.empty((0, segment_length), dtype=np.float32)
 
 
-class FrequencyAttributeExtractor:
-    """频域属性提取器"""
-
-    def __init__(self, fs=10000, lf_cutoff=1000, hf_cutoff=2500):
-        self.fs = fs
-        self.lf_cutoff = lf_cutoff
-        self.hf_cutoff = hf_cutoff
-        self.epsilon = 1e-8
-
-    def extract_frequency_ratios(self, signal):
-        """提取HF_ratio和LF_ratio"""
-        # 确保信号是一维的
-        if signal.ndim > 1:
-            signal = signal.flatten()
-
-        # FFT计算
-        N_fft = len(signal)
-        if N_fft < 2:
-            return 0.0, 0.0
-
-        fft_result = np.fft.fft(signal, N_fft)
-        power_spectrum = np.abs(fft_result[:N_fft // 2]) ** 2 / N_fft
-
-        # 频率轴
-        freqs = np.fft.fftfreq(N_fft, 1 / self.fs)[:N_fft // 2]
-
-        # 频带能量计算
-        lf_mask = (freqs >= 0) & (freqs <= self.lf_cutoff)
-        hf_mask = (freqs >= self.hf_cutoff) & (freqs <= self.fs / 2)
-
-        E_lf = np.sum(power_spectrum[lf_mask])
-        E_hf = np.sum(power_spectrum[hf_mask])
-        E_total = np.sum(power_spectrum) + self.epsilon
-
-        # 计算比值
-        lf_ratio = (E_lf + self.epsilon) / E_total
-        hf_ratio = (E_hf + self.epsilon) / E_total
-
-        return hf_ratio, lf_ratio
-
-
-class PseudoCompoundGenerator:
-    """伪复合故障生成器"""
-
-    def __init__(self, alpha_range=(0.3, 0.7)):
-        self.alpha_range = alpha_range
-        self.random_seed = 42
-        np.random.seed(self.random_seed)
-
-    def generate_compound_signals(self, signals_dict, num_samples_per_combination=50):
-        """生成伪复合故障信号"""
-        compound_signals = {}
-        compound_definitions = {
-            'inner_outer': ['inner', 'outer'],
-            'inner_ball': ['inner', 'ball'],
-            'outer_ball': ['outer', 'ball'],
-            'inner_outer_ball': ['inner', 'outer', 'ball']
-        }
-
-        # 首先确定统一的信号长度
-        signal_length = self._get_uniform_signal_length(signals_dict)
-        print(f"统一信号长度设定为: {signal_length}")
-
-        for compound_name, components in compound_definitions.items():
-            print(f"生成 {compound_name} 伪复合信号...")
-
-            if compound_name == 'inner_outer_ball':
-                # 对三重故障使用特殊策略
-                compound_list = self._generate_triple_compound_signals(signals_dict, num_samples_per_combination * 2,
-                                                                       signal_length)
-            else:
-                # 双重故障使用原有策略
-                compound_list = self._generate_double_compound_signals(signals_dict, components,
-                                                                       num_samples_per_combination, signal_length)
-
-            if compound_list:
-                # 确保所有信号长度一致后再转换为numpy数组
-                uniform_signals = self._ensure_uniform_length(compound_list, signal_length)
-                compound_signals[compound_name] = np.array(uniform_signals)
-                print(f"  生成了 {len(uniform_signals)} 个 {compound_name} 样本，信号长度: {signal_length}")
-
-        return compound_signals
-
-    def _get_uniform_signal_length(self, signals_dict):
-        """确定统一的信号长度"""
-        all_lengths = []
-        for fault_type, signals in signals_dict.items():
-            if len(signals) > 0:
-                for signal in signals[:10]:  # 只检查前10个样本
-                    all_lengths.append(len(signal))
-
-        if not all_lengths:
-            return 1024  # 默认长度
-
-        # 使用最常见的长度作为统一长度
-        from collections import Counter
-        length_counts = Counter(all_lengths)
-        most_common_length = length_counts.most_common(1)[0][0]
-        return most_common_length
-
-    def _ensure_uniform_length(self, signals, target_length):
-        """确保所有信号具有统一长度"""
-        uniform_signals = []
-        for signal in signals:
-            if len(signal) == target_length:
-                uniform_signals.append(signal)
-            elif len(signal) > target_length:
-                # 截断
-                uniform_signals.append(signal[:target_length])
-            else:
-                # 填充
-                pad_length = target_length - len(signal)
-                padded_signal = np.pad(signal, (0, pad_length), mode='edge')
-                uniform_signals.append(padded_signal)
-
-        return uniform_signals
-
-    def _generate_double_compound_signals(self, signals_dict, components, num_samples, signal_length):
-        """生成双重复合故障信号"""
-        compound_list = []
-        comp1, comp2 = components
-
-        if comp1 in signals_dict and comp2 in signals_dict and len(signals_dict[comp1]) > 0 and len(
-                signals_dict[comp2]) > 0:
-            for _ in range(num_samples):
-                try:
-                    sig1 = signals_dict[comp1][np.random.randint(len(signals_dict[comp1]))]
-                    sig2 = signals_dict[comp2][np.random.randint(len(signals_dict[comp2]))]
-
-                    # 确保信号长度一致
-                    sig1 = self._resize_signal(sig1, signal_length)
-                    sig2 = self._resize_signal(sig2, signal_length)
-
-                    alpha = np.random.uniform(*self.alpha_range)
-                    compound_sig = alpha * sig1 + (1 - alpha) * sig2
-
-                    # 验证生成的信号长度
-                    if len(compound_sig) == signal_length:
-                        compound_list.append(compound_sig)
-                except Exception as e:
-                    print(f"    生成双重复合信号时出错: {e}")
-                    continue
-
-        return compound_list
-
-    def _generate_triple_compound_signals(self, signals_dict, num_samples=150, signal_length=1024):
-        """专门为三重复合故障生成更多样化的伪信号"""
-        if not all(comp in signals_dict for comp in ['inner', 'outer', 'ball']):
-            return []
-
-        # 检查是否有足够的样本
-        for comp in ['inner', 'outer', 'ball']:
-            if len(signals_dict[comp]) == 0:
-                print(f"    警告: {comp} 类型没有样本，跳过三重复合生成")
-                return []
-
-        triple_signals = []
-        generation_strategies = [
-            'equal_weight',  # 等权重混合
-            'dominant_inner',  # 内圈主导
-            'dominant_outer',  # 外圈主导
-            'dominant_ball',  # 滚动体主导
-            'frequency_mixing',  # 频域混合
-            'time_segment'  # 时域分段
-        ]
-
-        samples_per_strategy = max(1, num_samples // len(generation_strategies))
-
-        for strategy in generation_strategies:
-            print(f"    使用策略 {strategy} 生成 {samples_per_strategy} 个样本")
-            strategy_success_count = 0
-
-            for _ in range(samples_per_strategy * 2):  # 尝试生成更多，以防失败
-                if strategy_success_count >= samples_per_strategy:
-                    break
-
-                try:
-                    sig_inner = signals_dict['inner'][np.random.randint(len(signals_dict['inner']))]
-                    sig_outer = signals_dict['outer'][np.random.randint(len(signals_dict['outer']))]
-                    sig_ball = signals_dict['ball'][np.random.randint(len(signals_dict['ball']))]
-
-                    # 确保信号长度一致
-                    sig_inner = self._resize_signal(sig_inner, signal_length)
-                    sig_outer = self._resize_signal(sig_outer, signal_length)
-                    sig_ball = self._resize_signal(sig_ball, signal_length)
-
-                    if strategy == 'equal_weight':
-                        # 等权重混合
-                        weights = np.array([1 / 3, 1 / 3, 1 / 3])
-                        compound_sig = weights[0] * sig_inner + weights[1] * sig_outer + weights[2] * sig_ball
-
-                    elif strategy == 'dominant_inner':
-                        # 内圈故障占主导
-                        weights = np.random.dirichlet([3, 1, 1])  # 内圈权重更大
-                        compound_sig = weights[0] * sig_inner + weights[1] * sig_outer + weights[2] * sig_ball
-
-                    elif strategy == 'dominant_outer':
-                        # 外圈故障占主导
-                        weights = np.random.dirichlet([1, 3, 1])
-                        compound_sig = weights[0] * sig_inner + weights[1] * sig_outer + weights[2] * sig_ball
-
-                    elif strategy == 'dominant_ball':
-                        # 滚动体故障占主导
-                        weights = np.random.dirichlet([1, 1, 3])
-                        compound_sig = weights[0] * sig_inner + weights[1] * sig_outer + weights[2] * sig_ball
-
-                    elif strategy == 'frequency_mixing':
-                        # 频域混合策略
-                        compound_sig = self._frequency_domain_mixing(sig_inner, sig_outer, sig_ball, signal_length)
-
-                    elif strategy == 'time_segment':
-                        # 时域分段策略
-                        compound_sig = self._time_domain_segmentation(sig_inner, sig_outer, sig_ball, signal_length)
-
-                    # 确保输出信号长度正确
-                    compound_sig = self._resize_signal(compound_sig, signal_length)
-
-                    # 添加轻微噪声增加多样性
-                    if np.std(compound_sig) > 0:
-                        noise_level = 0.01 * np.std(compound_sig)
-                        compound_sig += np.random.normal(0, noise_level, compound_sig.shape)
-
-                    # 验证生成的信号
-                    if len(compound_sig) == signal_length and np.all(np.isfinite(compound_sig)):
-                        triple_signals.append(compound_sig)
-                        strategy_success_count += 1
-
-                except Exception as e:
-                    print(f"    策略 {strategy} 生成信号时出错: {e}")
-                    continue
-
-            print(f"    策略 {strategy} 成功生成 {strategy_success_count} 个样本")
-
-        print(f"    三重复合信号总计生成: {len(triple_signals)} 个")
-        return triple_signals
-
-    def _resize_signal(self, signal, target_length):
-        """调整信号到目标长度"""
-        if len(signal) == target_length:
-            return signal
-        elif len(signal) > target_length:
-            # 截断
-            return signal[:target_length]
-        else:
-            # 填充
-            pad_length = target_length - len(signal)
-            return np.pad(signal, (0, pad_length), mode='edge')
-
-    def _frequency_domain_mixing(self, sig1, sig2, sig3, signal_length):
-        """频域混合策略"""
-        try:
-            # 对三个信号做FFT
-            fft1 = np.fft.fft(sig1)
-            fft2 = np.fft.fft(sig2)
-            fft3 = np.fft.fft(sig3)
-
-            # 分频段混合
-            N = len(fft1)
-            low_end = max(1, N // 6)  # 低频段
-            mid_end = max(low_end + 1, N // 3)  # 中频段
-
-            mixed_fft = fft1.copy()
-            # 低频主要来自外圈
-            mixed_fft[:low_end] = 0.6 * fft2[:low_end] + 0.3 * fft1[:low_end] + 0.1 * fft3[:low_end]
-            # 中频混合
-            mixed_fft[low_end:mid_end] = 0.4 * fft1[low_end:mid_end] + 0.3 * fft2[low_end:mid_end] + 0.3 * fft3[
-                                                                                                           low_end:mid_end]
-            # 高频主要来自滚动体
-            mixed_fft[mid_end:] = 0.1 * fft1[mid_end:] + 0.2 * fft2[mid_end:] + 0.7 * fft3[mid_end:]
-
-            result = np.real(np.fft.ifft(mixed_fft))
-            return self._resize_signal(result, signal_length)
-
-        except Exception as e:
-            print(f"频域混合出错: {e}, 使用简单加权混合")
-            weights = np.random.dirichlet([1, 1, 1])
-            result = weights[0] * sig1 + weights[1] * sig2 + weights[2] * sig3
-            return self._resize_signal(result, signal_length)
-
-    def _time_domain_segmentation(self, sig1, sig2, sig3, signal_length):
-        """时域分段策略"""
-        try:
-            seg_len = signal_length // 6
-
-            if seg_len < 10:  # 如果段太短，使用简单混合
-                weights = np.random.dirichlet([1, 1, 1])
-                result = weights[0] * sig1 + weights[1] * sig2 + weights[2] * sig3
-                return self._resize_signal(result, signal_length)
-
-            # 交替排列三种故障信号
-            segments = []
-            remaining_length = signal_length
-
-            for i in range(6):
-                if remaining_length <= 0:
-                    break
-
-                current_seg_len = min(seg_len, remaining_length)
-                start_idx = i * seg_len
-                end_idx = start_idx + current_seg_len
-
-                if i % 3 == 0:
-                    if end_idx <= len(sig1):
-                        segments.append(sig1[start_idx:end_idx])
-                    else:
-                        # 如果超出范围，使用循环索引
-                        segment = sig1[start_idx % len(sig1):(start_idx % len(sig1)) + current_seg_len]
-                        if len(segment) < current_seg_len:
-                            segment = np.tile(sig1, (current_seg_len // len(sig1) + 1))[:current_seg_len]
-                        segments.append(segment)
-                elif i % 3 == 1:
-                    if end_idx <= len(sig2):
-                        segments.append(sig2[start_idx:end_idx])
-                    else:
-                        segment = sig2[start_idx % len(sig2):(start_idx % len(sig2)) + current_seg_len]
-                        if len(segment) < current_seg_len:
-                            segment = np.tile(sig2, (current_seg_len // len(sig2) + 1))[:current_seg_len]
-                        segments.append(segment)
-                else:
-                    if end_idx <= len(sig3):
-                        segments.append(sig3[start_idx:end_idx])
-                    else:
-                        segment = sig3[start_idx % len(sig3):(start_idx % len(sig3)) + current_seg_len]
-                        if len(segment) < current_seg_len:
-                            segment = np.tile(sig3, (current_seg_len // len(sig3) + 1))[:current_seg_len]
-                        segments.append(segment)
-
-                remaining_length -= current_seg_len
-
-            if segments:
-                result = np.concatenate(segments)
-                return self._resize_signal(result, signal_length)
-            else:
-                # 如果分段失败，使用简单混合
-                weights = np.random.dirichlet([1, 1, 1])
-                result = weights[0] * sig1 + weights[1] * sig2 + weights[2] * sig3
-                return self._resize_signal(result, signal_length)
-
-        except Exception as e:
-            print(f"时域分段出错: {e}, 使用简单加权混合")
-            weights = np.random.dirichlet([1, 1, 1])
-            result = weights[0] * sig1 + weights[1] * sig2 + weights[2] * sig3
-            return self._resize_signal(result, signal_length)
 class DataPreprocessor:
     def __init__(self, sample_length=SEGMENT_LENGTH, overlap=OVERLAP, augment=True, random_seed=42):
         self.sample_length = sample_length
@@ -628,6 +285,98 @@ class DataPreprocessor:
         return np.vstack(processed_signals)
 
 
+class FrequencyAttributeExtractor:
+    """频域属性提取器"""
+
+    def __init__(self, fs=12000, lf_cutoff=1000, hf_cutoff=3000):
+        self.fs = fs
+        self.lf_cutoff = lf_cutoff
+        self.hf_cutoff = hf_cutoff
+        self.epsilon = 1e-8
+
+    def extract_frequency_ratios(self, signal):
+        """提取HF_ratio和LF_ratio"""
+        # 确保信号是一维的
+        if signal.ndim > 1:
+            signal = signal.flatten()
+
+        # FFT计算
+        N_fft = len(signal)
+        if N_fft < 2:
+            return 0.0, 0.0
+
+        fft_result = np.fft.fft(signal, N_fft)
+        power_spectrum = np.abs(fft_result[:N_fft // 2]) ** 2 / N_fft
+
+        # 频率轴
+        freqs = np.fft.fftfreq(N_fft, 1 / self.fs)[:N_fft // 2]
+
+        # 频带能量计算
+        lf_mask = (freqs >= 0) & (freqs <= self.lf_cutoff)
+        hf_mask = (freqs >= self.hf_cutoff) & (freqs <= self.fs / 2)
+
+        E_lf = np.sum(power_spectrum[lf_mask])
+        E_hf = np.sum(power_spectrum[hf_mask])
+        E_total = np.sum(power_spectrum) + self.epsilon
+
+        # 计算比值
+        lf_ratio = (E_lf + self.epsilon) / E_total
+        hf_ratio = (E_hf + self.epsilon) / E_total
+
+        return hf_ratio, lf_ratio
+
+
+class PseudoCompoundGenerator:
+    """伪复合故障生成器"""
+
+    def __init__(self, alpha_range=(0.3, 0.7)):
+        self.alpha_range = alpha_range
+        self.random_seed = 42
+        np.random.seed(self.random_seed)
+
+    def generate_compound_signals(self, signals_dict, num_samples_per_combination=50):
+        """生成伪复合故障信号"""
+        compound_signals = {}
+        compound_definitions = {
+            'inner_outer': ['inner', 'outer'],
+            'inner_ball': ['inner', 'ball'],
+            'outer_ball': ['outer', 'ball'],
+            'inner_outer_ball': ['inner', 'outer', 'ball']
+        }
+
+        for compound_name, components in compound_definitions.items():
+            print(f"生成 {compound_name} 伪复合信号...")
+            compound_list = []
+
+            for _ in range(num_samples_per_combination):
+                if len(components) == 2:
+                    # 双组件混合
+                    comp1, comp2 = components
+                    if comp1 in signals_dict and comp2 in signals_dict:
+                        sig1 = signals_dict[comp1][np.random.randint(len(signals_dict[comp1]))]
+                        sig2 = signals_dict[comp2][np.random.randint(len(signals_dict[comp2]))]
+                        alpha = np.random.uniform(*self.alpha_range)
+                        compound_sig = alpha * sig1 + (1 - alpha) * sig2
+                        compound_list.append(compound_sig)
+
+                elif len(components) == 3:
+                    # 三组件混合
+                    comp1, comp2, comp3 = components
+                    if all(comp in signals_dict for comp in components):
+                        sig1 = signals_dict[comp1][np.random.randint(len(signals_dict[comp1]))]
+                        sig2 = signals_dict[comp2][np.random.randint(len(signals_dict[comp2]))]
+                        sig3 = signals_dict[comp3][np.random.randint(len(signals_dict[comp3]))]
+
+                        # 三元权重分配
+                        weights = np.random.dirichlet([1, 1, 1])
+                        compound_sig = weights[0] * sig1 + weights[1] * sig2 + weights[2] * sig3
+                        compound_list.append(compound_sig)
+
+            if compound_list:
+                compound_signals[compound_name] = np.array(compound_list)
+                print(f"  生成了 {len(compound_list)} 个 {compound_name} 样本")
+
+        return compound_signals
 class ContrastiveAutoencoder(nn.Module):
     """
     1D 卷积编码器 + 全连接解码器的自编码器，
@@ -858,8 +607,6 @@ class FaultSemanticBuilder:
         self.enhanced_attribute_dim = 5
         self.data_semantics = {}
         self.idx_to_fault = {}
-        self.original_training_signals = {}
-        self.original_training_labels = None
         self.all_latent_features = None
         self.all_latent_labels = None
         self.compound_data_semantic_generation_rule = compound_data_semantic_generation_rule
@@ -869,17 +616,16 @@ class FaultSemanticBuilder:
             'inner_outer': [1, 1, 0], 'inner_ball': [1, 0, 1], 'outer_ball': [0, 1, 1],
             'inner_outer_ball': [1, 1, 1]
         }
-        self.fault_location_attributes = {
-            'normal': [0, 0, 0], 'inner': [1, 0, 0], 'outer': [0, 1, 0], 'ball': [0, 0, 1],
-            'inner_outer': [1, 1, 0], 'inner_ball': [1, 0, 1], 'outer_ball': [0, 1, 1],
-            'inner_outer_ball': [1, 1, 1]
-        }
-        self.frequency_stats = {}
-        self.single_fault_types_ordered = ['normal', 'inner', 'outer', 'ball']
         self.fault_types = {
             'normal': 0, 'inner': 1, 'outer': 2, 'ball': 3,
             'inner_outer': 4, 'inner_ball': 5, 'outer_ball': 6, 'inner_outer_ball': 7
         }
+        # 用于存储频域特征统计
+        self.frequency_stats = {}
+
+
+        self.single_fault_types_ordered = ['normal', 'inner', 'outer', 'ball']
+
         self.compound_fault_definitions = {
             'inner_outer': ['inner', 'outer'],
             'inner_ball': ['inner', 'ball'],
@@ -887,7 +633,7 @@ class FaultSemanticBuilder:
             'inner_outer_ball': ['inner', 'outer', 'ball']
         }
 
-        self.enhanced_attribute_dim = 3
+        self.enhanced_attribute_dim = 5
         self.freq_extractor = FrequencyAttributeExtractor()
         self.pseudo_generator = PseudoCompoundGenerator()
 
@@ -897,161 +643,10 @@ class FaultSemanticBuilder:
 
         # 用于存储伪复合数据
         self.pseudo_compound_data = {}
+    def _get_enhanced_attributes(self):
 
-    def augment_triple_compound_training_data(self):
-        """专门为三重故障增强训练数据 - 方案5"""
-        if not hasattr(self, 'pseudo_compound_data') or 'inner_outer_ball' not in self.pseudo_compound_data:
-            print("警告: 没有找到 inner_outer_ball 的伪复合数据，跳过增强")
-            return
-
-        print("开始增强 inner_outer_ball 训练数据...")
-        original_data = self.pseudo_compound_data['inner_outer_ball']
-        augmented_signals = []
-        augmented_attributes = []
-
-        # 1. 噪声增强
-        print("  应用噪声增强...")
-        noise_count = 0
-        for signal in original_data['signals']:
-            for noise_level in [0.005, 0.01, 0.015]:  # 减小噪声水平
-                try:
-                    noisy_signal = signal + np.random.normal(0, noise_level * np.std(signal), signal.shape)
-                    augmented_signals.append(noisy_signal)
-
-                    # 重新计算属性
-                    aug_attr = self.compute_enhanced_attributes(noisy_signal, 'inner_outer_ball')
-                    augmented_attributes.append(aug_attr)
-                    noise_count += 1
-                except Exception as e:
-                    print(f"    噪声增强出错: {e}")
-                    continue
-
-        print(f"    噪声增强生成 {noise_count} 个样本")
-
-        # 2. 幅度缩放
-        print("  应用幅度缩放...")
-        scale_count = 0
-        for signal in original_data['signals'][:30]:  # 选择部分样本
-            for scale_factor in [0.8, 1.2]:
-                try:
-                    scaled_signal = signal * scale_factor
-                    augmented_signals.append(scaled_signal)
-
-                    aug_attr = self.compute_enhanced_attributes(scaled_signal, 'inner_outer_ball')
-                    augmented_attributes.append(aug_attr)
-                    scale_count += 1
-                except Exception as e:
-                    print(f"    幅度缩放出错: {e}")
-                    continue
-
-        print(f"    幅度缩放生成 {scale_count} 个样本")
-
-        # 3. 时间扭曲（更保守的参数）
-        print("  应用时间扭曲...")
-        warp_count = 0
-        for signal in original_data['signals'][:20]:  # 选择部分样本
-            for factor in [0.98, 1.02]:  # 更小的扭曲因子
-                try:
-                    new_length = int(len(signal) * factor)
-                    if new_length < len(signal) // 2 or new_length > len(signal) * 2:
-                        continue
-
-                    indices = np.linspace(0, len(signal) - 1, new_length)
-                    warped_signal = np.interp(indices, np.arange(len(signal)), signal)
-
-                    # 调整到原长度
-                    if len(warped_signal) != len(signal):
-                        if len(warped_signal) > len(signal):
-                            warped_signal = warped_signal[:len(signal)]
-                        else:
-                            # 填充到原长度
-                            pad_length = len(signal) - len(warped_signal)
-                            warped_signal = np.pad(warped_signal, (0, pad_length), mode='edge')
-
-                    augmented_signals.append(warped_signal)
-
-                    aug_attr = self.compute_enhanced_attributes(warped_signal, 'inner_outer_ball')
-                    augmented_attributes.append(aug_attr)
-                    warp_count += 1
-                except Exception as e:
-                    print(f"    时间扭曲出错: {e}")
-                    continue
-
-        print(f"    时间扭曲生成 {warp_count} 个样本")
-
-        # 4. 频域增强
-        print("  应用频域增强...")
-        freq_count = 0
-        for signal in original_data['signals'][:25]:  # 选择部分样本
-            try:
-                # 轻微的频域滤波
-                fft_signal = np.fft.fft(signal)
-                # 对高频部分添加轻微扰动
-                high_freq_start = len(fft_signal) // 3
-                noise_factor = 0.05
-                fft_signal[high_freq_start:] *= (1 + noise_factor * np.random.randn(len(fft_signal) - high_freq_start))
-
-                enhanced_signal = np.real(np.fft.ifft(fft_signal))
-                augmented_signals.append(enhanced_signal)
-
-                aug_attr = self.compute_enhanced_attributes(enhanced_signal, 'inner_outer_ball')
-                augmented_attributes.append(aug_attr)
-                freq_count += 1
-            except Exception as e:
-                print(f"    频域增强出错: {e}")
-                continue
-
-        print(f"    频域增强生成 {freq_count} 个样本")
-
-        # 5. 更新训练数据
-        if augmented_signals:
-            total_augmented = len(augmented_signals)
-            print(f"总共为 inner_outer_ball 增强了 {total_augmented} 个样本")
-
-            # 重新编码增强样本
-            print("  重新编码增强样本...")
-            try:
-                with torch.no_grad():
-                    self.autoencoder.eval()
-                    augmented_encoded = []
-
-                    batch_size = 32
-                    for i in range(0, len(augmented_signals), batch_size):
-                        batch_signals = augmented_signals[i:i + batch_size]
-                        batch_tensors = []
-
-                        for signal in batch_signals:
-                            if len(signal) == self.autoencoder.input_length:
-                                signal_tensor = torch.FloatTensor(signal).unsqueeze(0).to(self.device)
-                                batch_tensors.append(signal_tensor)
-
-                        if batch_tensors:
-                            batch_tensor = torch.cat(batch_tensors, dim=0)
-                            encoded_batch = self.autoencoder.encode(batch_tensor).cpu().numpy()
-                            augmented_encoded.extend(encoded_batch)
-
-                    if len(augmented_encoded) > 0:
-                        # 合并到原数据
-                        all_encoded = np.vstack([original_data['encoded'], np.array(augmented_encoded)])
-                        all_attributes = np.vstack(
-                            [original_data['attributes'], np.array(augmented_attributes[:len(augmented_encoded)])])
-                        all_signals = np.vstack(
-                            [original_data['signals'], np.array(augmented_signals[:len(augmented_encoded)])])
-
-                        self.pseudo_compound_data['inner_outer_ball'] = {
-                            'encoded': all_encoded,
-                            'attributes': all_attributes,
-                            'signals': all_signals
-                        }
-
-                        print(f"  成功增强 inner_outer_ball 数据，总样本数: {len(all_encoded)}")
-                    else:
-                        print("  警告: 增强样本编码失败")
-
-            except Exception as e:
-                print(f"重新编码增强样本时出错: {e}")
-        else:
-            print("  没有生成增强样本")
+        return {ft: np.array(attrs, dtype=np.float32)
+                for ft, attrs in self.fault_location_attributes.items()}
 
     def compute_enhanced_attributes(self, signal, fault_type):
         """计算5维增强属性向量"""
@@ -1075,34 +670,26 @@ class FaultSemanticBuilder:
         """训练AE并生成伪复合数据"""
         print("训练自编码器并生成伪复合故障数据...")
 
-        # 保存原始训练数据以供后续使用
-        self.original_training_signals = {}
-        self.original_training_labels = labels
-
-        # 按故障类型分组存储原始信号
-        for fault_name in self.single_fault_types_ordered:
-            # 通过idx_to_fault反向查找故障索引
-            fault_idx = None
-            for idx, name in self.idx_to_fault.items():
-                if name == fault_name:
-                    fault_idx = idx
-                    break
-
-            if fault_idx is not None:
-                mask = (labels == fault_idx)
-                if np.any(mask):
-                    self.original_training_signals[fault_name] = X_train[mask]
-                    print(f"  存储 {fault_name}: {np.sum(mask)} 个原始信号样本")
-
         # 1. 先按原来的方式训练AE
         self.train_autoencoder(X_train, labels, epochs, batch_size, lr, contrastive_weight)
 
-        # 2. 生成伪复合故障（使用存储的原始信号）
+        # 2. 准备单一故障信号字典
+        single_fault_signals = {}
+        single_fault_indices = [self.fault_types[name] for name in self.single_fault_types_ordered]
+
+        for i, fault_name in enumerate(self.single_fault_types_ordered):
+            fault_idx = self.fault_types[fault_name]
+            mask = (labels == fault_idx)
+            if np.any(mask):
+                single_fault_signals[fault_name] = X_train[mask]
+                print(f"  {fault_name}: {np.sum(mask)} 个样本")
+
+        # 3. 生成伪复合故障
         pseudo_compound_signals = self.pseudo_generator.generate_compound_signals(
-            self.original_training_signals, num_samples_per_combination=100
+            single_fault_signals, num_samples_per_combination=100
         )
 
-        # 3. 对伪复合信号进行AE编码并计算增强属性
+        # 4. 对伪复合信号进行AE编码并计算增强属性
         self.pseudo_compound_data = {}
 
         with torch.no_grad():
@@ -1112,47 +699,24 @@ class FaultSemanticBuilder:
                 enhanced_attrs_list = []
 
                 for signal in signals:
-                    try:
-                        # 确保信号长度正确
-                        if len(signal) != self.autoencoder.input_length:
-                            if len(signal) > self.autoencoder.input_length:
-                                signal = signal[:self.autoencoder.input_length]
-                            else:
-                                # 填充到正确长度
-                                pad_length = self.autoencoder.input_length - len(signal)
-                                signal = np.pad(signal, (0, pad_length), mode='edge')
+                    # AE编码
+                    signal_tensor = torch.FloatTensor(signal).unsqueeze(0).to(self.device)
+                    encoded = self.autoencoder.encode(signal_tensor).cpu().numpy().squeeze()
+                    encoded_list.append(encoded)
 
-                        # AE编码
-                        signal_tensor = torch.FloatTensor(signal).unsqueeze(0).to(self.device)
-                        encoded = self.autoencoder.encode(signal_tensor).cpu().numpy().squeeze()
-                        encoded_list.append(encoded)
+                    # 计算增强属性
+                    enhanced_attr = self.compute_enhanced_attributes(signal, compound_name)
+                    enhanced_attrs_list.append(enhanced_attr)
 
-                        # 计算增强属性
-                        enhanced_attr = self.compute_enhanced_attributes(signal, compound_name)
-                        enhanced_attrs_list.append(enhanced_attr)
-                    except Exception as e:
-                        print(f"处理 {compound_name} 信号时出错: {e}")
-                        continue
+                self.pseudo_compound_data[compound_name] = {
+                    'encoded': np.array(encoded_list),
+                    'attributes': np.array(enhanced_attrs_list),
+                    'signals': signals
+                }
 
-                if encoded_list:
-                    self.pseudo_compound_data[compound_name] = {
-                        'encoded': np.array(encoded_list),
-                        'attributes': np.array(enhanced_attrs_list),
-                        'signals': signals
-                    }
-
-                    print(f"  生成 {compound_name} 的编码和属性: {len(encoded_list)} 个")
-
-        # 4. 对三重复合故障进行数据增强 (方案5)
-        print("\n应用三重复合故障数据增强...")
-        self.augment_triple_compound_training_data()
+                print(f"  生成 {compound_name} 的编码和属性: {len(encoded_list)} 个")
 
         return self.autoencoder
-    def _get_enhanced_attributes(self):
-
-        return {ft: np.array(attrs, dtype=np.float32)
-                for ft, attrs in self.fault_location_attributes.items()}
-
     def build_knowledge_semantics(self):
         """构建基于轴承故障位置和尺寸的知识语义 (Unchanged from original)"""
         knowledge_semantics = {
@@ -1473,7 +1037,7 @@ class FaultSemanticBuilder:
         print(f"Mapper训练数据: {len(X_mapper_list)} 个样本")
 
         # 训练Mapper
-        mapper_epochs = 300
+        mapper_epochs = 200
         mapper_batch_size = min(32, len(X_mapper_train))
 
         train_dataset = TensorDataset(X_mapper_train, Y_mapper_train)
@@ -1544,16 +1108,15 @@ class FaultSemanticBuilder:
 
     def _get_sample_signals_for_fault(self, fault_name):
         """获取指定故障类型的样本信号"""
-        if hasattr(self, 'original_training_signals') and fault_name in self.original_training_signals:
+        if fault_name in self.original_training_signals:
             signals = self.original_training_signals[fault_name]
             # 随机选择一些样本（比如最多10个）
             num_samples = min(10, len(signals))
-            if len(signals) > 0:
-                indices = np.random.choice(len(signals), num_samples, replace=False)
-                return signals[indices]
-
-        print(f"警告: 未找到故障类型 {fault_name} 的原始信号，返回空列表")
-        return []
+            indices = np.random.choice(len(signals), num_samples, replace=False)
+            return signals[indices]
+        else:
+            print(f"警告: 未找到故障类型 {fault_name} 的原始信号")
+            return []
 
     def _synthesize_by_rule(self, single_fault_prototypes, rule, specific_types=None):
         """Helper function for direct rule-based synthesis (average or sum)."""
@@ -2620,6 +2183,202 @@ class ZeroShotCompoundFaultDiagnosis:
             (1, 1, 1): 'inner_outer_ball'
         }
         return combo_to_name.get(tuple(combination), 'normal')
+    def evaluate_zero_shot_with_pca(self, data_dict, target_compound_semantics, pca_components=3):
+        """使用SAE投影的语义和PCA降维后的欧氏距离进行零样本复合故障分类"""
+        print(f"\n评估ZSL（PCA方法）：使用SAE投影语义，在{pca_components}维PCA空间比较...")
+
+        self.cnn_model.eval()
+        self.sae_model.eval()
+        self.semantic_builder.autoencoder.eval()
+
+        X_test_signals, y_test_labels = data_dict['X_test'], data_dict['y_test']
+        valid_compound_fault_names = list(target_compound_semantics.keys())
+        valid_compound_fault_indices = [self.fault_types[name] for name in valid_compound_fault_names if
+                                        name in self.fault_types]
+
+        mask_eval = np.isin(y_test_labels, valid_compound_fault_indices)
+        X_eval_signals = X_test_signals[mask_eval]
+        y_eval_labels = y_test_labels[mask_eval]
+        reference_semantic_vectors_list = []
+        reference_labels_list = []  # Store corresponding fault indices
+        for name, vec in target_compound_semantics.items():
+            reference_semantic_vectors_list.append(vec)
+            reference_labels_list.append(self.fault_types[name])
+        reference_semantic_vectors_np = np.array(reference_semantic_vectors_list)
+        predicted_semantic_vectors_list = []
+        actual_labels_for_pred_list = []
+        batch_size_eval = self.batch_size
+
+        with torch.no_grad():
+            for i in range(0, len(X_eval_signals), batch_size_eval):
+                batch_x_sig = torch.FloatTensor(X_eval_signals[i:i + batch_size_eval]).to(self.device)
+                batch_y_lbl = y_eval_labels[i:i + batch_size_eval]
+                ae_input = batch_x_sig.squeeze(1) if batch_x_sig.dim() == 3 and batch_x_sig.shape[
+                    1] == 1 else batch_x_sig
+                if ae_input.dim() != 2 or ae_input.shape[1] != self.semantic_builder.autoencoder.input_length:
+                    continue
+                current_ae_sem = self.semantic_builder.autoencoder.encode(ae_input)
+                cnn_feats = self.cnn_model(batch_x_sig, current_ae_sem, return_features=True)
+                sae_pred_sem = self.sae_model(cnn_feats)
+
+                predicted_semantic_vectors_list.append(sae_pred_sem.cpu().numpy())
+                actual_labels_for_pred_list.extend(batch_y_lbl)
+        predicted_semantic_vectors_np = np.vstack(predicted_semantic_vectors_list)
+        y_eval_labels_final = np.array(actual_labels_for_pred_list)
+        all_semantics_for_pca = np.vstack([predicted_semantic_vectors_np, reference_semantic_vectors_np])
+
+        actual_pca_comps = min(pca_components, all_semantics_for_pca.shape[0], all_semantics_for_pca.shape[1])
+
+
+        pca = PCA(n_components=actual_pca_comps)
+        pca.fit(all_semantics_for_pca)
+
+        predicted_sem_pca = pca.transform(predicted_semantic_vectors_np)
+        reference_sem_pca = pca.transform(reference_semantic_vectors_np)
+        print(f"  语义空间维度: {predicted_semantic_vectors_np.shape[1]} -> PCA降维后: {predicted_sem_pca.shape[1]}")
+
+        y_classified_indices = []
+        for pred_pca_vec in predicted_sem_pca:
+            dists = [np.linalg.norm(pred_pca_vec - ref_pca_vec) for ref_pca_vec in reference_sem_pca]
+            nearest_idx = np.argmin(dists)
+            y_classified_indices.append(reference_labels_list[nearest_idx])  # Predicted fault index
+
+        y_classified_indices_np = np.array(y_classified_indices)
+
+        accuracy = accuracy_score(y_eval_labels_final, y_classified_indices_np) * 100
+        class_accuracy_results = {}
+        print("\n=== 各类别分类详情 (PCA + 欧氏距离, 语义空间) ===")
+        for fault_idx_true in np.unique(y_eval_labels_final):
+            mask = (y_eval_labels_final == fault_idx_true)
+            count = np.sum(mask)
+            correct_count = np.sum(y_classified_indices_np[mask] == y_eval_labels_final[
+                mask])  # Check if classified index matches true index
+            acc = (correct_count / count) * 100 if count > 0 else 0
+            fault_name = self.idx_to_fault.get(fault_idx_true, f"Unknown_{fault_idx_true}")
+            class_accuracy_results[fault_name] = acc
+            print(f"类别 {fault_name}: {correct_count}/{count} 正确, 准确率 {acc:.2f}%")
+        print(f"\n总体准确率 (PCA, 语义空间): {accuracy:.2f}%")
+
+        # Confusion Matrix
+        true_labels_str = [self.idx_to_fault.get(l, f"Unk_{l}") for l in y_eval_labels_final]
+        pred_labels_str = [self.idx_to_fault.get(l, f"Unk_{l}") for l in y_classified_indices_np]
+        # Use names from target_compound_semantics as the full set of labels for CM display
+        cm_display_labels = sorted(list(target_compound_semantics.keys()))
+
+        conf_matrix_val = confusion_matrix(true_labels_str, pred_labels_str, labels=cm_display_labels)
+
+        configure_chinese_font()
+        plt.figure(figsize=(10, 8))
+        sns.heatmap(conf_matrix_val, annot=True, fmt='d', cmap='Blues',
+                    xticklabels=cm_display_labels, yticklabels=cm_display_labels)
+        plt.xlabel('预测')
+        plt.ylabel('真实')
+        plt.title(f'ZSL混淆矩阵 (SAE投影语义+PCA, 准确率: {accuracy:.2f}%)')
+        plt.xticks(rotation=45, ha='right');
+        plt.yticks(rotation=0)
+        plt.tight_layout()
+        plt.savefig('compound_fault_cm_zsl_sae_pca.png')
+        plt.close()
+        print("混淆矩阵 (SAE+PCA) 已保存至 'compound_fault_cm_zsl_sae_pca.png'")
+
+        return accuracy, class_accuracy_results
+
+    def evaluate_zero_shot_with_cosine_similarity(self, data_dict, target_compound_semantics):
+        """使用SAE投影的语义和原始语义空间中的余弦相似度进行零样本复合故障分类"""
+        print("\n评估ZSL（余弦相似度方法）：使用SAE投影语义，在原始融合语义空间比较...")
+
+        self.cnn_model.eval()
+        self.sae_model.eval()
+        self.semantic_builder.autoencoder.eval()
+
+        X_test_signals, y_test_labels = data_dict['X_test'], data_dict['y_test']
+
+        valid_compound_fault_names = list(target_compound_semantics.keys())
+        valid_compound_fault_indices = [self.fault_types[name] for name in valid_compound_fault_names if
+                                        name in self.fault_types]
+
+        mask_eval_cosine = np.isin(y_test_labels, valid_compound_fault_indices)
+        X_eval_signals_cosine = X_test_signals[mask_eval_cosine]
+        y_eval_labels_cosine = y_test_labels[mask_eval_cosine]
+        reference_semantic_vectors_list_cos = []
+        reference_labels_list_cos = []
+        for name, vec in target_compound_semantics.items():
+            reference_semantic_vectors_list_cos.append(vec)
+            reference_labels_list_cos.append(self.fault_types[name])
+        reference_semantic_vectors_np_cos = np.array(reference_semantic_vectors_list_cos)
+        reference_semantic_norm_cos = reference_semantic_vectors_np_cos / (
+                    np.linalg.norm(reference_semantic_vectors_np_cos, axis=1, keepdims=True) + 1e-9)
+        predicted_semantic_vectors_list_cos = []
+        actual_labels_for_pred_list_cos = []
+        batch_size_eval = self.batch_size
+
+        with torch.no_grad():
+            for i in range(0, len(X_eval_signals_cosine), batch_size_eval):
+                batch_x_sig_cos = torch.FloatTensor(X_eval_signals_cosine[i:i + batch_size_eval]).to(self.device)
+                batch_y_lbl_cos = y_eval_labels_cosine[i:i + batch_size_eval]
+
+                ae_input_cos = batch_x_sig_cos.squeeze(1) if batch_x_sig_cos.dim() == 3 and batch_x_sig_cos.shape[
+                    1] == 1 else batch_x_sig_cos
+                if ae_input_cos.dim() != 2 or ae_input_cos.shape[1] != self.semantic_builder.autoencoder.input_length:
+                    continue
+                current_ae_sem_cos = self.semantic_builder.autoencoder.encode(ae_input_cos)
+
+                cnn_feats_cos = self.cnn_model(batch_x_sig_cos, current_ae_sem_cos, return_features=True)
+                sae_pred_sem_cos = self.sae_model(cnn_feats_cos)
+
+                predicted_semantic_vectors_list_cos.append(sae_pred_sem_cos.cpu().numpy())
+                actual_labels_for_pred_list_cos.extend(batch_y_lbl_cos)
+
+        predicted_semantic_vectors_np_cos = np.vstack(predicted_semantic_vectors_list_cos)
+        y_eval_labels_final_cos = np.array(actual_labels_for_pred_list_cos)
+        predicted_semantic_norm_cos = predicted_semantic_vectors_np_cos / (
+                    np.linalg.norm(predicted_semantic_vectors_np_cos, axis=1, keepdims=True) + 1e-9)
+
+        # Classification using Cosine Similarity
+        similarity_matrix = np.dot(predicted_semantic_norm_cos, reference_semantic_norm_cos.T)
+        y_classified_indices_cos = []
+        for i in range(similarity_matrix.shape[0]):
+            nearest_idx = np.argmax(similarity_matrix[i])
+            y_classified_indices_cos.append(reference_labels_list_cos[nearest_idx])
+
+        y_classified_indices_np_cos = np.array(y_classified_indices_cos)
+
+        accuracy_cos = accuracy_score(y_eval_labels_final_cos, y_classified_indices_np_cos) * 100
+        class_accuracy_cosine_results = {}
+        print("\n=== 各类别分类详情 (余弦相似度, 语义空间) ===")
+        for fault_idx_true_cos in np.unique(y_eval_labels_final_cos):
+            mask_cos = (y_eval_labels_final_cos == fault_idx_true_cos)
+            count_cos = np.sum(mask_cos)
+            correct_count_cos = np.sum(y_classified_indices_np_cos[mask_cos] == y_eval_labels_final_cos[mask_cos])
+            acc_cos_cls = (correct_count_cos / count_cos) * 100 if count_cos > 0 else 0
+            fault_name_cos = self.idx_to_fault.get(fault_idx_true_cos, f"Unknown_{fault_idx_true_cos}")
+            class_accuracy_cosine_results[fault_name_cos] = acc_cos_cls
+            print(f"类别 {fault_name_cos}: {correct_count_cos}/{count_cos} 正确, 准确率 {acc_cos_cls:.2f}%")
+        print(f"\n总体准确率 (余弦相似度, 语义空间): {accuracy_cos:.2f}%")
+
+        # Confusion Matrix
+        true_labels_str_cos = [self.idx_to_fault.get(l, f"Unk_{l}") for l in y_eval_labels_final_cos]
+        pred_labels_str_cos = [self.idx_to_fault.get(l, f"Unk_{l}") for l in y_classified_indices_np_cos]
+        cm_display_labels_cos = sorted(list(target_compound_semantics.keys()))
+
+        conf_matrix_val_cos = confusion_matrix(true_labels_str_cos, pred_labels_str_cos, labels=cm_display_labels_cos)
+
+        configure_chinese_font()
+        plt.figure(figsize=(10, 8))
+        sns.heatmap(conf_matrix_val_cos, annot=True, fmt='d', cmap='Greens',
+                    xticklabels=cm_display_labels_cos, yticklabels=cm_display_labels_cos)
+        plt.xlabel('预测标签')
+        plt.ylabel('真实标签')
+        plt.title(f'ZSL混淆矩阵 (SAE投影语义+余弦相似度, 准确率: {accuracy_cos:.2f}%)')
+        plt.xticks(rotation=45, ha='right');
+        plt.yticks(rotation=0)
+        plt.tight_layout()
+        plt.savefig('compound_fault_cm_zsl_sae_cosine.png')
+        plt.close()
+        print("混淆矩阵 (SAE+余弦) 已保存至 'compound_fault_cm_zsl_sae_cosine.png'")
+
+        return accuracy_cos, class_accuracy_cosine_results
+
     def visualize_semantic_space(self, data_dict, semantic_dict):
         """
         可视化单一故障和复合故障在自编码器语义空间的分布 (AE latent space from FaultSemanticBuilder)
@@ -2943,200 +2702,6 @@ class ZeroShotCompoundFaultDiagnosis:
         else:
             print("CNN特征可视化：样本过少，跳过t-SNE。")
 
-    def evaluate_zero_shot_with_pca(self, data_dict, target_compound_semantics, pca_components=3):
-        """使用SAE投影的语义和PCA降维后的欧氏距离进行零样本复合故障分类"""
-        print(f"\n评估ZSL（PCA方法）：使用SAE投影语义，在{pca_components}维PCA空间比较...")
-
-        self.cnn_model.eval()
-        self.sae_model.eval()
-        self.semantic_builder.autoencoder.eval()
-
-        X_test_signals, y_test_labels = data_dict['X_test'], data_dict['y_test']
-        valid_compound_fault_names = list(target_compound_semantics.keys())
-        valid_compound_fault_indices = [self.fault_types[name] for name in valid_compound_fault_names if
-                                        name in self.fault_types]
-
-        mask_eval = np.isin(y_test_labels, valid_compound_fault_indices)
-        X_eval_signals = X_test_signals[mask_eval]
-        y_eval_labels = y_test_labels[mask_eval]
-        reference_semantic_vectors_list = []
-        reference_labels_list = []  # Store corresponding fault indices
-        for name, vec in target_compound_semantics.items():
-            reference_semantic_vectors_list.append(vec)
-            reference_labels_list.append(self.fault_types[name])
-        reference_semantic_vectors_np = np.array(reference_semantic_vectors_list)
-        predicted_semantic_vectors_list = []
-        actual_labels_for_pred_list = []
-        batch_size_eval = self.batch_size
-
-        with torch.no_grad():
-            for i in range(0, len(X_eval_signals), batch_size_eval):
-                batch_x_sig = torch.FloatTensor(X_eval_signals[i:i + batch_size_eval]).to(self.device)
-                batch_y_lbl = y_eval_labels[i:i + batch_size_eval]
-                ae_input = batch_x_sig.squeeze(1) if batch_x_sig.dim() == 3 and batch_x_sig.shape[
-                    1] == 1 else batch_x_sig
-                if ae_input.dim() != 2 or ae_input.shape[1] != self.semantic_builder.autoencoder.input_length:
-                    continue
-                current_ae_sem = self.semantic_builder.autoencoder.encode(ae_input)
-                cnn_feats = self.cnn_model(batch_x_sig, current_ae_sem, return_features=True)
-                sae_pred_sem = self.sae_model(cnn_feats)
-
-                predicted_semantic_vectors_list.append(sae_pred_sem.cpu().numpy())
-                actual_labels_for_pred_list.extend(batch_y_lbl)
-        predicted_semantic_vectors_np = np.vstack(predicted_semantic_vectors_list)
-        y_eval_labels_final = np.array(actual_labels_for_pred_list)
-        all_semantics_for_pca = np.vstack([predicted_semantic_vectors_np, reference_semantic_vectors_np])
-
-        actual_pca_comps = min(pca_components, all_semantics_for_pca.shape[0], all_semantics_for_pca.shape[1])
-
-        pca = PCA(n_components=actual_pca_comps)
-        pca.fit(all_semantics_for_pca)
-
-        predicted_sem_pca = pca.transform(predicted_semantic_vectors_np)
-        reference_sem_pca = pca.transform(reference_semantic_vectors_np)
-        print(f"  语义空间维度: {predicted_semantic_vectors_np.shape[1]} -> PCA降维后: {predicted_sem_pca.shape[1]}")
-
-        y_classified_indices = []
-        for pred_pca_vec in predicted_sem_pca:
-            dists = [np.linalg.norm(pred_pca_vec - ref_pca_vec) for ref_pca_vec in reference_sem_pca]
-            nearest_idx = np.argmin(dists)
-            y_classified_indices.append(reference_labels_list[nearest_idx])  # Predicted fault index
-
-        y_classified_indices_np = np.array(y_classified_indices)
-
-        accuracy = accuracy_score(y_eval_labels_final, y_classified_indices_np) * 100
-        class_accuracy_results = {}
-        print("\n=== 各类别分类详情 (PCA + 欧氏距离, 语义空间) ===")
-        for fault_idx_true in np.unique(y_eval_labels_final):
-            mask = (y_eval_labels_final == fault_idx_true)
-            count = np.sum(mask)
-            correct_count = np.sum(y_classified_indices_np[mask] == y_eval_labels_final[
-                mask])  # Check if classified index matches true index
-            acc = (correct_count / count) * 100 if count > 0 else 0
-            fault_name = self.idx_to_fault.get(fault_idx_true, f"Unknown_{fault_idx_true}")
-            class_accuracy_results[fault_name] = acc
-            print(f"类别 {fault_name}: {correct_count}/{count} 正确, 准确率 {acc:.2f}%")
-        print(f"\n总体准确率 (PCA, 语义空间): {accuracy:.2f}%")
-
-        # Confusion Matrix
-        true_labels_str = [self.idx_to_fault.get(l, f"Unk_{l}") for l in y_eval_labels_final]
-        pred_labels_str = [self.idx_to_fault.get(l, f"Unk_{l}") for l in y_classified_indices_np]
-        # Use names from target_compound_semantics as the full set of labels for CM display
-        cm_display_labels = sorted(list(target_compound_semantics.keys()))
-
-        conf_matrix_val = confusion_matrix(true_labels_str, pred_labels_str, labels=cm_display_labels)
-
-        configure_chinese_font()
-        plt.figure(figsize=(10, 8))
-        sns.heatmap(conf_matrix_val, annot=True, fmt='d', cmap='Blues',
-                    xticklabels=cm_display_labels, yticklabels=cm_display_labels)
-        plt.xlabel('预测')
-        plt.ylabel('真实')
-        plt.title(f'ZSL混淆矩阵 (SAE投影语义+PCA, 准确率: {accuracy:.2f}%)')
-        plt.xticks(rotation=45, ha='right');
-        plt.yticks(rotation=0)
-        plt.tight_layout()
-        plt.savefig('compound_fault_cm_zsl_sae_pca.png')
-        plt.close()
-        print("混淆矩阵 (SAE+PCA) 已保存至 'compound_fault_cm_zsl_sae_pca.png'")
-
-        return accuracy, class_accuracy_results
-
-    def evaluate_zero_shot_with_cosine_similarity(self, data_dict, target_compound_semantics):
-        """使用SAE投影的语义和原始语义空间中的余弦相似度进行零样本复合故障分类"""
-        print("\n评估ZSL（余弦相似度方法）：使用SAE投影语义，在原始融合语义空间比较...")
-
-        self.cnn_model.eval()
-        self.sae_model.eval()
-        self.semantic_builder.autoencoder.eval()
-
-        X_test_signals, y_test_labels = data_dict['X_test'], data_dict['y_test']
-
-        valid_compound_fault_names = list(target_compound_semantics.keys())
-        valid_compound_fault_indices = [self.fault_types[name] for name in valid_compound_fault_names if
-                                        name in self.fault_types]
-
-        mask_eval_cosine = np.isin(y_test_labels, valid_compound_fault_indices)
-        X_eval_signals_cosine = X_test_signals[mask_eval_cosine]
-        y_eval_labels_cosine = y_test_labels[mask_eval_cosine]
-        reference_semantic_vectors_list_cos = []
-        reference_labels_list_cos = []
-        for name, vec in target_compound_semantics.items():
-            reference_semantic_vectors_list_cos.append(vec)
-            reference_labels_list_cos.append(self.fault_types[name])
-        reference_semantic_vectors_np_cos = np.array(reference_semantic_vectors_list_cos)
-        reference_semantic_norm_cos = reference_semantic_vectors_np_cos / (
-                np.linalg.norm(reference_semantic_vectors_np_cos, axis=1, keepdims=True) + 1e-9)
-        predicted_semantic_vectors_list_cos = []
-        actual_labels_for_pred_list_cos = []
-        batch_size_eval = self.batch_size
-
-        with torch.no_grad():
-            for i in range(0, len(X_eval_signals_cosine), batch_size_eval):
-                batch_x_sig_cos = torch.FloatTensor(X_eval_signals_cosine[i:i + batch_size_eval]).to(self.device)
-                batch_y_lbl_cos = y_eval_labels_cosine[i:i + batch_size_eval]
-
-                ae_input_cos = batch_x_sig_cos.squeeze(1) if batch_x_sig_cos.dim() == 3 and batch_x_sig_cos.shape[
-                    1] == 1 else batch_x_sig_cos
-                if ae_input_cos.dim() != 2 or ae_input_cos.shape[1] != self.semantic_builder.autoencoder.input_length:
-                    continue
-                current_ae_sem_cos = self.semantic_builder.autoencoder.encode(ae_input_cos)
-
-                cnn_feats_cos = self.cnn_model(batch_x_sig_cos, current_ae_sem_cos, return_features=True)
-                sae_pred_sem_cos = self.sae_model(cnn_feats_cos)
-
-                predicted_semantic_vectors_list_cos.append(sae_pred_sem_cos.cpu().numpy())
-                actual_labels_for_pred_list_cos.extend(batch_y_lbl_cos)
-
-        predicted_semantic_vectors_np_cos = np.vstack(predicted_semantic_vectors_list_cos)
-        y_eval_labels_final_cos = np.array(actual_labels_for_pred_list_cos)
-        predicted_semantic_norm_cos = predicted_semantic_vectors_np_cos / (
-                np.linalg.norm(predicted_semantic_vectors_np_cos, axis=1, keepdims=True) + 1e-9)
-
-        # Classification using Cosine Similarity
-        similarity_matrix = np.dot(predicted_semantic_norm_cos, reference_semantic_norm_cos.T)
-        y_classified_indices_cos = []
-        for i in range(similarity_matrix.shape[0]):
-            nearest_idx = np.argmax(similarity_matrix[i])
-            y_classified_indices_cos.append(reference_labels_list_cos[nearest_idx])
-
-        y_classified_indices_np_cos = np.array(y_classified_indices_cos)
-
-        accuracy_cos = accuracy_score(y_eval_labels_final_cos, y_classified_indices_np_cos) * 100
-        class_accuracy_cosine_results = {}
-        print("\n=== 各类别分类详情 (余弦相似度, 语义空间) ===")
-        for fault_idx_true_cos in np.unique(y_eval_labels_final_cos):
-            mask_cos = (y_eval_labels_final_cos == fault_idx_true_cos)
-            count_cos = np.sum(mask_cos)
-            correct_count_cos = np.sum(y_classified_indices_np_cos[mask_cos] == y_eval_labels_final_cos[mask_cos])
-            acc_cos_cls = (correct_count_cos / count_cos) * 100 if count_cos > 0 else 0
-            fault_name_cos = self.idx_to_fault.get(fault_idx_true_cos, f"Unknown_{fault_idx_true_cos}")
-            class_accuracy_cosine_results[fault_name_cos] = acc_cos_cls
-            print(f"类别 {fault_name_cos}: {correct_count_cos}/{count_cos} 正确, 准确率 {acc_cos_cls:.2f}%")
-        print(f"\n总体准确率 (余弦相似度, 语义空间): {accuracy_cos:.2f}%")
-
-        # Confusion Matrix
-        true_labels_str_cos = [self.idx_to_fault.get(l, f"Unk_{l}") for l in y_eval_labels_final_cos]
-        pred_labels_str_cos = [self.idx_to_fault.get(l, f"Unk_{l}") for l in y_classified_indices_np_cos]
-        cm_display_labels_cos = sorted(list(target_compound_semantics.keys()))
-
-        conf_matrix_val_cos = confusion_matrix(true_labels_str_cos, pred_labels_str_cos, labels=cm_display_labels_cos)
-
-        configure_chinese_font()
-        plt.figure(figsize=(10, 8))
-        sns.heatmap(conf_matrix_val_cos, annot=True, fmt='d', cmap='Greens',
-                    xticklabels=cm_display_labels_cos, yticklabels=cm_display_labels_cos)
-        plt.xlabel('预测标签')
-        plt.ylabel('真实标签')
-        plt.title(f'ZSL混淆矩阵 (SAE投影语义+余弦相似度, 准确率: {accuracy_cos:.2f}%)')
-        plt.xticks(rotation=45, ha='right');
-        plt.yticks(rotation=0)
-        plt.tight_layout()
-        plt.savefig('compound_fault_cm_zsl_sae_cosine.png')
-        plt.close()
-        print("混淆矩阵 (SAE+余弦) 已保存至 'compound_fault_cm_zsl_sae_cosine.png'")
-
-        return accuracy_cos, class_accuracy_cosine_results
     def run_pipeline(self):
         """基于语义自编码器(SAE)的零样本复合故障诊断流水线"""
         start_time = time.time()
