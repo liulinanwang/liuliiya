@@ -717,15 +717,45 @@ class FaultSemanticBuilder:
                 print(f"  生成 {compound_name} 的编码和属性: {len(encoded_list)} 个")
 
         return self.autoencoder
-    def build_knowledge_semantics(self):
-        """构建基于轴承故障位置和尺寸的知识语义 (Unchanged from original)"""
-        knowledge_semantics = {
-            fault_type: np.array(location_encoding, dtype=np.float32)
-            for fault_type, location_encoding in self.fault_location_attributes.items()
-        }
-        self.knowledge_dim = 3
 
-        return knowledge_semantics
+    def build_knowledge_semantics(self):
+        """构建基于增强属性的知识语义"""
+        print("构建增强知识语义（5维）...")
+
+        enhanced_knowledge_semantics = {}
+
+        # 对每种故障类型计算增强属性
+        for fault_type in self.fault_types.keys():
+            if fault_type in self.fault_location_attributes:
+                # 获取3维位置编码
+                location_attrs = np.array(self.fault_location_attributes[fault_type], dtype=np.float32)
+
+                # 获取默认频域特征（或从训练数据统计）
+                default_freq_features = self._get_default_frequency_features(fault_type)
+
+                # 组合成5维增强属性
+                enhanced_attrs = np.concatenate([location_attrs, default_freq_features])
+                enhanced_knowledge_semantics[fault_type] = enhanced_attrs
+
+        # 更新知识语义维度
+        self.knowledge_dim = 5  # 更新为5维
+
+        return enhanced_knowledge_semantics
+
+    def _get_default_frequency_features(self, fault_type):
+        """为不同故障类型提供默认的频域特征"""
+        # 基于轴承故障机理的经验值
+        defaults = {
+            'normal': [0.15, 0.60],  # 正常：低频占比高，高频占比低
+            'inner': [0.25, 0.45],  # 内圈：中等分布
+            'outer': [0.20, 0.55],  # 外圈：偏向低频
+            'ball': [0.35, 0.35],  # 滚动体：高频成分较多
+            'inner_outer': [0.22, 0.50],  # 内外圈复合
+            'inner_ball': [0.30, 0.40],  # 内圈+滚动体
+            'outer_ball': [0.28, 0.45],  # 外圈+滚动体
+            'inner_outer_ball': [0.25, 0.42]  # 三元复合
+        }
+        return np.array(defaults.get(fault_type, [0.20, 0.50]), dtype=np.float32)
 
     def _ae_contrastive_loss(self, latent, latent_aug, labels, temperature=0.2):
         """计算对比损失 (logic matching gen.py _contrastive_loss)."""
@@ -1464,7 +1494,7 @@ class ZeroShotCompoundFaultDiagnosis:
 
         self.cnn_model = None
         self.sae_model = None
-
+        self.semantic_builder.enhanced_attribute_dim = 5
         self.actual_ae_latent_dim = -1
         self.cnn_feature_dim = CNN_FEATURE_DIM
         self.fused_semantic_dim = -1
@@ -1650,13 +1680,17 @@ class ZeroShotCompoundFaultDiagnosis:
     def build_semantics(self, data_dict):
         """构建增强的语义表示"""
         print("构建增强故障语义...")
-        knowledge_semantics = self.semantic_builder.build_knowledge_semantics()
 
+        # 构建5维增强知识语义
+        enhanced_knowledge_semantics = self.semantic_builder.build_knowledge_semantics()
+
+        print(f"  增强知识语义维度: {self.semantic_builder.knowledge_dim}")
+
+        # 训练AE并生成伪复合数据
         print("  训练自编码器并生成伪复合数据...")
         X_train_ae = data_dict.get('X_train')
         y_train_ae = data_dict.get('y_train')
 
-        # 使用新的训练方法
         self.semantic_builder.train_autoencoder_with_pseudo_compound(
             X_train_ae, labels=y_train_ae, epochs=AE_EPOCHS,
             batch_size=AE_BATCH_SIZE, lr=AE_LR
@@ -1664,69 +1698,49 @@ class ZeroShotCompoundFaultDiagnosis:
 
         self.actual_ae_latent_dim = self.semantic_builder.actual_latent_dim
         single_fault_prototypes = self.semantic_builder.data_semantics
+        print(f"  AE数据语义维度: {self.actual_ae_latent_dim}")
 
-        # 使用增强的语义合成
+        # 使用增强属性合成复合故障语义
         compound_data_semantics = self.semantic_builder.synthesize_compound_semantics(single_fault_prototypes)
-        print(f"  Compound data semantics synthesized for {len(compound_data_semantics)} types.")
+        print(f"  复合数据语义合成完成")
 
-        data_only_semantics = {**single_fault_prototypes, **compound_data_semantics}
-
-        fused_semantics = {}
+        # 重新计算融合语义维度
         self.fused_semantic_dim = self.semantic_builder.knowledge_dim + self.actual_ae_latent_dim
         print(
-            f"  Fused semantic dimension will be: {self.fused_semantic_dim} (Knowledge: {self.semantic_builder.knowledge_dim} + AE_Data: {self.actual_ae_latent_dim})")
+            f"  融合语义维度: {self.fused_semantic_dim} (知识语义: {self.semantic_builder.knowledge_dim} + AE数据语义: {self.actual_ae_latent_dim})")
 
-        for ft, k_vec in knowledge_semantics.items():
+        # 构建融合语义
+        data_only_semantics = {**single_fault_prototypes, **compound_data_semantics}
+        fused_semantics = {}
+
+        for ft, enhanced_k_vec in enhanced_knowledge_semantics.items():
             d_vec = data_only_semantics.get(ft)
 
-            if d_vec is not None and k_vec is not None and \
-                    np.all(np.isfinite(k_vec)) and np.all(np.isfinite(d_vec)) and \
-                    len(k_vec) == self.semantic_builder.knowledge_dim and \
+            if d_vec is not None and enhanced_k_vec is not None and \
+                    np.all(np.isfinite(enhanced_k_vec)) and np.all(np.isfinite(d_vec)) and \
+                    len(enhanced_k_vec) == self.semantic_builder.knowledge_dim and \
                     len(d_vec) == self.actual_ae_latent_dim:
-                fused_vec = np.concatenate([k_vec, d_vec]).astype(np.float32)
+                # 拼接5维知识语义 + AE语义
+                fused_vec = np.concatenate([enhanced_k_vec, d_vec]).astype(np.float32)
 
                 if np.all(np.isfinite(fused_vec)) and len(fused_vec) == self.fused_semantic_dim:
                     fused_semantics[ft] = fused_vec
                 else:
-                    print(
-                        f"W: Fused vector for '{ft}' is invalid or has wrong dimension after concatenation. k_len={len(k_vec)}, d_len={len(d_vec)}, expected_fused={self.fused_semantic_dim}")
+                    print(f"警告: '{ft}' 的融合向量维度错误或包含非有限值")
 
-        single_fault_latent_features = self.semantic_builder.all_latent_features
-        single_fault_latent_labels = self.semantic_builder.all_latent_labels
-        for ft_name in self.fault_types.keys():
-            if ft_name not in fused_semantics:
-                print(f"Warning: Fused semantic for '{ft_name}' not generated. Attempting fallback.")
-                k_fallback = knowledge_semantics.get(ft_name)
-                d_fallback = None
-                if ft_name in single_fault_prototypes and np.all(np.isfinite(single_fault_prototypes[ft_name])):
-                    d_fallback = single_fault_prototypes[ft_name]
-                elif ft_name in compound_data_semantics and np.all(np.isfinite(compound_data_semantics[ft_name])):
-                    d_fallback = compound_data_semantics[ft_name]
-                else:  # Last resort for d_vec if not found
-                    if self.actual_ae_latent_dim > 0:
-                        d_fallback = np.zeros(self.actual_ae_latent_dim, dtype=np.float32)
-                        print(f"  Using zero vector for AE semantic part of '{ft_name}' in fallback.")
-
-                if k_fallback is not None and d_fallback is not None and \
-                        len(k_fallback) == self.semantic_builder.knowledge_dim and \
-                        len(d_fallback) == self.actual_ae_latent_dim:
-                    fused_vec_fallback = np.concatenate([k_fallback, d_fallback]).astype(np.float32)
-                    if np.all(np.isfinite(fused_vec_fallback)) and len(fused_vec_fallback) == self.fused_semantic_dim:
-                        fused_semantics[ft_name] = fused_vec_fallback
-                        print(f"  Successfully created fallback fused semantic for '{ft_name}'.")
-                    else:
-                        print(f"Error: Fallback fused semantic for '{ft_name}' is invalid.")
-                else:
-                    print(f"Error: Could not create fallback fused semantic for '{ft_name}' due to missing components.")
+        # 验证融合语义
+        print(f"  成功构建融合语义的故障类型数: {len(fused_semantics)}")
+        for ft, fused_vec in fused_semantics.items():
+            print(f"    {ft}: 维度 {len(fused_vec)}")
 
         return {
-            'knowledge_semantics': knowledge_semantics,
+            'knowledge_semantics': enhanced_knowledge_semantics,  # 现在是5维
             'data_prototypes': single_fault_prototypes,
             'compound_data_semantics': compound_data_semantics,
-            'data_only_semantics': data_only_semantics,  # AE latent space prototypes
-            'fused_semantics': fused_semantics,  # knowledge + AE latent space prototypes
-            'single_fault_latent_features': single_fault_latent_features,  # All AE latent features from training
-            'single_fault_latent_labels': single_fault_latent_labels
+            'data_only_semantics': data_only_semantics,
+            'fused_semantics': fused_semantics,  # 现在是5+64=69维
+            'single_fault_latent_features': self.semantic_builder.all_latent_features,
+            'single_fault_latent_labels': self.semantic_builder.all_latent_labels
         }
 
     def train_ae_data_semantic_cnn(self, data_dict, semantic_dict, epochs=CNN_EPOCHS,
@@ -1870,13 +1884,18 @@ class ZeroShotCompoundFaultDiagnosis:
     def train_semantic_autoencoder(self, data_dict, semantic_dict, epochs=SAE_EPOCHS, lr=SAE_LR, batch_size_sae=None):
         print("\n--- 开始训练语义自编码器 (SAE) ---")
 
-        if batch_size_sae is None: batch_size_sae = self.batch_size
+        if batch_size_sae is None:
+            batch_size_sae = self.batch_size
 
         self.cnn_model.eval()
         self.semantic_builder.autoencoder.eval()
+
+        # 使用更新后的融合语义维度
+        print(f"SAE 初始化: 输入维度 (CNN特征)={self.cnn_feature_dim}, 输出维度 (融合语义)={self.fused_semantic_dim}")
+
         self.sae_model = SemanticAutoencoder(
             feature_dim=self.cnn_feature_dim,
-            semantic_dim=self.fused_semantic_dim
+            semantic_dim=self.fused_semantic_dim  # 现在应该是69维
         ).to(self.device)
         print(f"SAE 初始化: 输入维度 (CNN特征)={self.cnn_feature_dim}, 输出维度 (融合语义)={self.fused_semantic_dim}")
 
