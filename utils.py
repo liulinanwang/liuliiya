@@ -1,159 +1,167 @@
-import os
 import numpy as np
-import scipy.io
+import pywt
+from PyEMD import CEEMDAN, EMD
+from scipy.stats import kurtosis, skew, entropy
+import pyfftw
 from scipy import signal
-from scipy.stats import kurtosis
-import pandas as pd
 
 
-# --- 1. 特征提取函数定义 ---
-
-def calculate_mean_abs(data):
+def wavelet_packet_energy(signal_data, wavelet='db4', level=3):
     """
-    计算平均峰值 (此处解释为信号绝对值的平均值)
+    小波包分解提取能量特征，适合捕捉球体故障的非平稳特性
     """
-    return np.mean(np.abs(data))
+    wp = pywt.WaveletPacket(data=signal_data, wavelet=wavelet, mode='symmetric', maxlevel=level)
+    nodes = [node.path for node in wp.get_level(level)]
+
+    # 提取节点能量特征并归一化
+    energy_features = {}
+    total_energy = 0
+    for node in nodes:
+        node_data = wp[node].data
+        energy = np.sum(node_data ** 2)
+        energy_features[f'wp_energy_{node}'] = energy
+        total_energy += energy
+
+    # 归一化能量特征
+    if total_energy > 0:
+        for key in energy_features:
+            energy_features[key] /= total_energy
+
+    return energy_features
 
 
-def calculate_std(data):
+def emd_feature_extraction(signal_data, num_imfs=5):
     """
-    计算标准差
+    使用经验模态分解提取特征，适合球体故障的非线性特性
     """
-    return np.std(data)
+    emd = EMD()
+    imfs = emd(signal_data, max_imf=num_imfs)
+
+    features = {}
+    for i, imf in enumerate(imfs[:num_imfs]):
+        # 提取每个IMF的统计特征
+        features[f'imf{i}_mean'] = np.mean(imf)
+        features[f'imf{i}_std'] = np.std(imf)
+        features[f'imf{i}_kurtosis'] = kurtosis(imf)
+        features[f'imf{i}_skewness'] = skew(imf)
+
+        # 提取IMF的频域特征
+        fft_mag = np.abs(np.fft.fft(imf))
+        features[f'imf{i}_peak_freq'] = np.argmax(fft_mag[:len(fft_mag) // 2]) / len(fft_mag) * 2
+        features[f'imf{i}_energy'] = np.sum(fft_mag ** 2) / len(fft_mag)
+
+    return features
 
 
-def calculate_peak_to_peak(data):
+def cyclic_spectral_coherence(signal_data, fs, fmax=None, alpha_max=None):
     """
-    计算峰峰值
+    循环谱相干分析，特别适合提取调制信号特征
     """
-    return np.ptp(data)
+    if fmax is None:
+        fmax = fs / 2  # 奈奎斯特频率
+    if alpha_max is None:
+        alpha_max = fs / 4  # 最大循环频率
+
+    # 分段计算
+    nperseg = min(1024, len(signal_data) // 10)
+    noverlap = nperseg // 2
+
+    # 使用Welch方法估计循环谱密度
+    f, alpha, Sxx = signal.cyclic_spectrum(signal_data, fs, nperseg=nperseg, noverlap=noverlap,
+                                           fmax=fmax, alpha_max=alpha_max)
+
+    # 提取循环谱特征
+    features = {}
+
+    # 找出显著的循环频率
+    alpha_energy = np.sum(np.abs(Sxx), axis=0)
+    top_alpha_indices = np.argsort(alpha_energy)[-5:]  # 提取5个最显著的循环频率
+
+    for i, idx in enumerate(top_alpha_indices):
+        features[f'cyclic_freq_{i}'] = alpha[idx]
+        features[f'cyclic_energy_{i}'] = alpha_energy[idx]
+
+    # 集成整体特征
+    features['cyclic_total_energy'] = np.sum(alpha_energy)
+    features['cyclic_max_energy'] = np.max(alpha_energy)
+
+    return features
 
 
-def calculate_impulse_factor(data):
+def teager_kaiser_energy(signal_data):
     """
-    计算冲击因子: 峰值 / 绝对值的平均值
+    Teager-Kaiser能量算子，能有效捕捉瞬态变化
     """
-    mean_abs = np.mean(np.abs(data))
-    if mean_abs == 0:
-        return 0
-    return np.max(np.abs(data)) / mean_abs
+    n = len(signal_data)
+    tk_energy = np.zeros(n - 2)
+
+    for i in range(1, n - 1):
+        tk_energy[i - 1] = signal_data[i] ** 2 - signal_data[i - 1] * signal_data[i + 1]
+
+    # 提取TK能量特征
+    features = {
+        'tk_mean': np.mean(tk_energy),
+        'tk_std': np.std(tk_energy),
+        'tk_max': np.max(tk_energy),
+        'tk_kurtosis': kurtosis(tk_energy)
+    }
+
+    return features
 
 
-def calculate_envelope_kurtosis(data):
+def self_correlation_features(signal_data, max_lag=100):
     """
-    计算包络峭度
+    自相关特征提取，适合周期性故障特征
     """
-    # 使用希尔伯特变换获取解析信号
-    analytic_signal = signal.hilbert(data)
-    # 获取包络线
-    envelope = np.abs(analytic_signal)
-    # 计算包络线的峭度
-    return kurtosis(envelope)
+    correlation = np.correlate(signal_data, signal_data, mode='full')
+    correlation = correlation[len(correlation) // 2:len(correlation) // 2 + max_lag]
+
+    # 归一化
+    correlation = correlation / correlation[0]
+
+    # 找出自相关的峰值
+    peaks, _ = signal.find_peaks(correlation, height=0.2, distance=5)
+
+    features = {}
+    if len(peaks) > 0:
+        features['corr_first_peak_pos'] = peaks[0]
+        features['corr_first_peak_val'] = correlation[peaks[0]]
+        features['corr_peak_mean'] = np.mean(correlation[peaks])
+        features['corr_peak_std'] = np.std(correlation[peaks])
+
+        # 计算峰值间距
+        if len(peaks) > 1:
+            peak_distances = np.diff(peaks)
+            features['corr_peak_dist_mean'] = np.mean(peak_distances)
+            features['corr_peak_dist_std'] = np.std(peak_distances)
+
+    return features
 
 
-def calculate_spectral_entropy(data):
+def extract_advanced_features(signal_data, fs):
     """
-    计算频谱熵
+    综合高级特征提取函数
     """
-    # 计算傅里叶变换和功率谱
-    fft_vals = np.fft.fft(data)
-    ps = np.abs(fft_vals) ** 2
+    features = {}
 
-    # 将功率谱归一化为概率分布
-    ps_norm = ps / np.sum(ps)
+    # 1. 小波包能量特征
+    wp_features = wavelet_packet_energy(signal_data)
+    features.update(wp_features)
 
-    # 计算熵
-    # 添加一个极小值 1e-12 来避免 log(0)
-    entropy = -np.sum(ps_norm * np.log2(ps_norm + 1e-12))
-    return entropy
+    # 2. EMD特征
+    emd_features = emd_feature_extraction(signal_data)
+    features.update(emd_features)
 
+    # 3. Teager-Kaiser能量特征
+    tk_features = teager_kaiser_energy(signal_data)
+    features.update(tk_features)
 
-def calculate_mean_psd(data, fs=12800):
-    """
-    计算平均功率谱密度 (PSD)
-    使用Welch方法计算PSD，fs是采样频率。
-    根据HDU轴承数据集的常用配置，采样频率通常为 12800 Hz。
-    """
-    _, psd = signal.welch(data, fs=fs)
-    return np.mean(psd)
+    # 4. 自相关特征
+    corr_features = self_correlation_features(signal_data)
+    features.update(corr_features)
 
+    # 5. 循环谱特征（计算密集，可选）
+    # cyclic_features = cyclic_spectral_coherence(signal_data, fs)
+    # features.update(cyclic_features)
 
-# --- 2. 数据路径和配置 ---
-
-# !!!重要提示: 请确保此路径是您系统上的正确路径!!!
-data_path = "E:/研究生/CNN/HDU Bearing Dataset"
-
-# 定义故障文件相对路径
-fault_files = {
-    'normal': os.path.join('Simple Fault', '1 Normal', 'f600', 'rpm1200_f600', 'rpm1200_f600_01.mat'),
-    'inner': os.path.join('Simple Fault', '2 IF', 'f600', 'rpm1200_f600', 'rpm1200_f600_01.mat'),
-    'outer': os.path.join('Simple Fault', '3 OF', 'f600', 'rpm1200_f600', 'rpm1200_f600_01.mat'),
-    'ball': os.path.join('Simple Fault', '4 BF', 'f600', 'rpm1200_f600', 'rpm1200_f600_01.mat'),
-    'inner_outer': os.path.join('Compound Fault', '1 IF&OF', 'f600', 'rpm1200_f600', 'rpm1200_f600_01.mat'),
-    'inner_ball': os.path.join('Compound Fault', '2 IF&BF', 'f600', 'rpm1200_f600', 'rpm1200_f600_01.mat'),
-    'outer_ball': os.path.join('Compound Fault', '3 OF&BF', 'f600', 'rpm1200_f600', 'rpm1200_f600_01.mat'),
-    'inner_outer_ball': os.path.join('Compound Fault', '5 IF&OF&BF', 'f600', 'rpm1200_f600', 'rpm1200_f600_01.mat')
-}
-
-# 采样频率 (根据HDU数据集文档)
-SAMPLING_FREQUENCY = 12800
-
-# --- 3. 主处理循环 ---
-
-results = []
-print("--- 开始提取特征 ---")
-
-for fault_type, file_name in fault_files.items():
-    full_path = os.path.join(data_path, file_name)
-    print(f"正在处理: {full_path}...")
-
-    try:
-        # 加载 .mat 文件
-        mat_data = scipy.io.loadmat(full_path)
-
-        # 动态查找数据键名 (通常与文件名相同)
-        file_key = os.path.splitext(os.path.basename(file_name))[0]
-        if file_key not in mat_data:
-            # 如果找不到，尝试使用文件中的第一个非系统变量名
-            potential_keys = [k for k in mat_data if not k.startswith('__')]
-            if not potential_keys:
-                raise ValueError("在MAT文件中未找到数据键。")
-            file_key = potential_keys[0]
-            print(
-                f"  > 警告: 未找到键 '{os.path.splitext(os.path.basename(file_name))[0]}', 将使用键 '{file_key}' 代替。")
-
-        vibration_data = mat_data[file_key]
-
-        # 根据故障类型选择正确的列
-        if fault_type == 'inner':
-            # 内圈故障使用第五列 (索引为4)
-            signal_data = vibration_data[:, 4].flatten()
-        else:
-            # 其他故障使用第四列 (索引为3)
-            signal_data = vibration_data[:, 3].flatten()
-
-        # --- 4. 计算所有特征 ---
-        features = {
-            '故障类型': fault_type,
-            '平均峰值': calculate_mean_abs(signal_data),
-            '标准差': calculate_std(signal_data),
-            '频谱熵': calculate_spectral_entropy(signal_data),
-            '峰峰值': calculate_peak_to_peak(signal_data),
-            '冲击因子': calculate_impulse_factor(signal_data),
-            '包络峭度': calculate_envelope_kurtosis(signal_data),
-            '平均功率谱密度': calculate_mean_psd(signal_data, fs=SAMPLING_FREQUENCY)
-        }
-        results.append(features)
-        print(f"  > {fault_type} 特征提取完成。")
-
-    except FileNotFoundError:
-        print(f"  > 错误: 文件未找到 {full_path}。请检查您的 `data_path` 和文件名是否正确。")
-    except Exception as e:
-        print(f"  > 错误: 处理 {file_name} 时发生错误: {e}")
-
-# --- 5. 显示结果 ---
-if results:
-    df_results = pd.DataFrame(results).set_index('故障类型')
-    print("\n\n--- 提取的特征汇总 ---")
-    # 使用 to_string() 以确保所有列都能完整显示
-    print(df_results.to_string())
+    return features
