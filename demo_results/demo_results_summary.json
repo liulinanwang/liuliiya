@@ -1,0 +1,62 @@
+{
+  "config": {
+    "cae_feature_dim": 512,
+    "vae_semantic_dim": 16,
+    "batch_size": 64,
+    "learning_rate": 0.001,
+    "epochs": 50,
+    "dropout_rate": 0.3,
+    "early_stopping_patience": 10,
+    "weight_decay": 1e-05,
+    "random_seed": 42,
+    "tsne_perplexity": 30,
+    "tsne_n_iter": 1000,
+    "save_model_path": "models",
+    "figure_save_path": "figures"
+  },
+  "training_history": {
+    "final_train_loss": 0.18435473988453546,
+    "final_val_loss": 0.015562434564344585,
+    "best_val_loss": 0.015425451332703233,
+    "total_epochs": 50,
+    "training_time": 4.6671576499938965
+  },
+  "performance_metrics": {
+    "mean_reconstruction_error": 0.015453863888978958,
+    "std_reconstruction_error": 0.005502174608409405,
+    "mean_cosine_similarity": 0.9006897807121277,
+    "std_cosine_similarity": 0.037235505878925323
+  },
+  "alignment_analysis": {
+    "fault_types": [
+      "inner_ball",
+      "inner",
+      "outer_ball",
+      "normal",
+      "inner_outer_ball",
+      "outer",
+      "ball",
+      "inner_outer"
+    ],
+    "mean_similarities": [
+      0.897066593170166,
+      0.9056984782218933,
+      0.9028129577636719,
+      0.8991758823394775,
+      0.9071474671363831,
+      0.8884375095367432,
+      0.8950850367546082,
+      0.9084078073501587
+    ],
+    "std_similarities": [
+      0.035736095160245895,
+      0.03747259080410004,
+      0.03879876807332039,
+      0.03154652565717697,
+      0.03458816558122635,
+      0.03993236646056175,
+      0.040004827082157135,
+      0.03416817635297775
+    ]
+  }
+}
