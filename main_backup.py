@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 # START OF FILE model.py
 # V2 - Aligning AE parts closer to gen.py description
-# V3 - Added CNN to VAE projection analysis integration
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -31,17 +30,6 @@ from collections import Counter # Added Counter
 import traceback # Added traceback
 
 warnings.filterwarnings('ignore')
-
-# Import configuration and projection system
-try:
-    from config import ENABLE_PROJECTION_ANALYSIS
-    from projection_system import CNNToVAEProjectionSystem
-    PROJECTION_AVAILABLE = True
-    print("Projection analysis system loaded successfully")
-except ImportError as e:
-    ENABLE_PROJECTION_ANALYSIS = False
-    PROJECTION_AVAILABLE = False
-    print(f"Warning: Projection analysis not available: {e}")
 
 
 # --- Configuration & Constants ---
@@ -1166,18 +1154,6 @@ class ZeroShotCompoundFaultDiagnosis:
         # Loss for CNN training needs careful handling of its projection layer params
         self.consistency_loss_fn = None
 
-        # === CNN到VAE投影分析系统集成 ===
-        # Initialize projection analysis system
-        self.projection_system = None
-        self.enable_projection = ENABLE_PROJECTION_ANALYSIS and PROJECTION_AVAILABLE
-        self.cnn_features_for_projection = None  # Store CNN features for projection
-        self.signal_data_for_projection = None   # Store signal data for VAE training
-        
-        if self.enable_projection:
-            print("Projection analysis enabled")
-        else:
-            print("Projection analysis disabled")
-
 
     # visualize_data_semantics_distribution (Calls AE extraction) - Modified for robustness in V1
     def visualize_data_semantics_distribution(self, data_dict):
@@ -1586,11 +1562,6 @@ class ZeroShotCompoundFaultDiagnosis:
         if self.consistency_loss_fn: self.consistency_loss_fn.eval()
         print(f"CNN Training Complete. Best Val Acc: {best_val_acc:.2f}% (or corresponding train metric)")
 
-        # === 为投影分析提取CNN特征 ===
-        if self.enable_projection:
-            print("Extracting CNN features for projection analysis...")
-            self._extract_cnn_features_for_projection(data_dict)
-
 
     # train_semantic_embedding (Inputs adjusted)
     def train_semantic_embedding(self, semantic_dict, data_dict):
@@ -1770,130 +1741,10 @@ class ZeroShotCompoundFaultDiagnosis:
         return accuracy, conf_matrix
 
 
-    def _extract_cnn_features_for_projection(self, data_dict):
-        """
-        为投影分析提取CNN特征
-        Extract CNN features for projection analysis
-        """
-        try:
-            X_train = data_dict.get('X_train')
-            y_train = data_dict.get('y_train')
-            
-            if X_train is None or len(X_train) == 0:
-                print("Warning: No training data available for CNN feature extraction")
-                return
-            
-            print(f"Extracting CNN features from {len(X_train)} training samples...")
-            
-            self.cnn_model.eval()
-            cnn_features = []
-            labels_for_projection = []
-            
-            inference_batch_size = self.batch_size * 2
-            
-            with torch.no_grad():
-                for i in range(0, len(X_train), inference_batch_size):
-                    batch_x = X_train[i:i+inference_batch_size]
-                    batch_y = y_train[i:i+inference_batch_size]
-                    
-                    batch_tensor = torch.FloatTensor(batch_x).to(self.device)
-                    
-                    # 使用CNN提取特征（不使用语义输入）
-                    try:
-                        features = self.cnn_model(batch_tensor, semantic=None, return_features=True)
-                        
-                        if torch.all(torch.isfinite(features)):
-                            cnn_features.append(features.cpu().numpy())
-                            labels_for_projection.extend(batch_y)
-                        else:
-                            print(f"Warning: Non-finite CNN features at batch {i}")
-                    except Exception as e:
-                        print(f"Warning: CNN feature extraction failed at batch {i}: {e}")
-            
-            if cnn_features:
-                self.cnn_features_for_projection = np.vstack(cnn_features)
-                self.labels_for_projection = np.array(labels_for_projection)
-                
-                # 同时存储对应的原始信号数据用于VAE训练
-                signal_samples = []
-                valid_indices = []
-                for i, label in enumerate(self.labels_for_projection):
-                    if i < len(X_train):
-                        signal_samples.append(X_train[i])
-                        valid_indices.append(i)
-                
-                if signal_samples:
-                    self.signal_data_for_projection = np.array(signal_samples)
-                    print(f"Extracted {len(self.cnn_features_for_projection)} CNN feature vectors")
-                    print(f"CNN feature dimension: {self.cnn_features_for_projection.shape[1]}")
-                else:
-                    print("Warning: No valid signal data for projection analysis")
-            else:
-                print("Warning: No CNN features extracted for projection analysis")
-                
-        except Exception as e:
-            print(f"Error extracting CNN features for projection: {e}")
-            traceback.print_exc()
-
-
-    def run_projection_analysis(self):
-        """
-        运行CNN到VAE语义空间投影分析
-        Run CNN to VAE semantic space projection analysis
-        """
-        if not self.enable_projection:
-            print("Projection analysis is disabled")
-            return None
-        
-        if (self.cnn_features_for_projection is None or 
-            self.signal_data_for_projection is None):
-            print("Error: CNN features or signal data not available for projection analysis")
-            return None
-        
-        try:
-            # 询问用户是否要进行投影分析
-            user_input = input("\n是否要进行CNN到VAE语义空间投影分析？(y/n): ").strip().lower()
-            if user_input not in ['y', 'yes', '是']:
-                print("跳过投影分析")
-                return None
-            
-            print("\n开始CNN到VAE语义空间投影分析...")
-            
-            # 初始化投影系统
-            if self.projection_system is None:
-                self.projection_system = CNNToVAEProjectionSystem(device=self.device)
-            
-            # 运行投影分析
-            results = self.projection_system.run_projection_analysis(
-                signal_data=self.signal_data_for_projection,
-                cnn_features=self.cnn_features_for_projection,
-                labels=self.labels_for_projection
-            )
-            
-            if results['success']:
-                print("\n=== 投影分析结果摘要 ===")
-                if 'alignment_metrics' in results:
-                    metrics = results['alignment_metrics']
-                    print(f"MSE损失: {metrics.get('mse_loss', 'N/A'):.6f}")
-                    print(f"余弦相似性: {metrics.get('cosine_similarity', 'N/A'):.4f}")
-                    print(f"对齐分数: {metrics.get('alignment_score', 'N/A'):.4f}")
-                
-                return results
-            else:
-                print(f"投影分析失败: {results.get('error', 'Unknown error')}")
-                return None
-                
-        except Exception as e:
-            print(f"投影分析过程中发生错误: {e}")
-            traceback.print_exc()
-            return None
-
-
     # run_pipeline unchanged
     def run_pipeline(self):
         """Runs the full ZSL pipeline."""
         start_time = time.time(); accuracy = 0.0
-        projection_results = None
         try:
             print("\n--- Step 1: Load Data ---")
             data_dict = self.load_data()
@@ -1922,13 +1773,6 @@ class ZeroShotCompoundFaultDiagnosis:
             print("\n--- Step 7: Evaluate ZSL ---")
             accuracy, _ = self.evaluate_zero_shot(data_dict, compound_projections)
 
-            # === 新增步骤：CNN到VAE语义空间投影分析 ===
-            print("\n--- Step 8: CNN to VAE Projection Analysis (Optional) ---")
-            if self.enable_projection:
-                projection_results = self.run_projection_analysis()
-            else:
-                print("Projection analysis is disabled in configuration")
-
         except Exception as e:
             print(f"E: Pipeline failed: {e}")
             traceback.print_exc()
@@ -1936,13 +1780,7 @@ class ZeroShotCompoundFaultDiagnosis:
 
         end_time = time.time()
         print(f"\n--- Pipeline Finished in {(end_time - start_time)/60:.2f} minutes ---")
-        
-        # 返回包含投影分析结果的字典
-        return {
-            'zsl_accuracy': accuracy,
-            'projection_results': projection_results,
-            'success': accuracy > 0.0
-        }
+        return accuracy
 
 if __name__ == "__main__":
     set_seed(42)
@@ -1953,28 +1791,5 @@ if __name__ == "__main__":
         fault_diagnosis = ZeroShotCompoundFaultDiagnosis(
             data_path=data_path, sample_length=SEGMENT_LENGTH,
             latent_dim=AE_LATENT_DIM, batch_size=DEFAULT_BATCH_SIZE )
-        
-        # 运行完整管道
-        results = fault_diagnosis.run_pipeline()
-        
-        # 显示结果
-        if isinstance(results, dict):
-            final_accuracy = results.get('zsl_accuracy', 0.0)
-            projection_results = results.get('projection_results')
-            
-            print(f"\n>>> Final ZSL Accuracy: {final_accuracy:.2f}% <<<")
-            
-            if projection_results and projection_results.get('success'):
-                print("\n>>> Projection Analysis Results <<<")
-                metrics = projection_results.get('alignment_metrics', {})
-                print(f"MSE Loss: {metrics.get('mse_loss', 'N/A')}")
-                print(f"Cosine Similarity: {metrics.get('cosine_similarity', 'N/A')}")
-                print(f"Alignment Score: {metrics.get('alignment_score', 'N/A')}")
-            elif projection_results:
-                print(f"\n>>> Projection Analysis Failed: {projection_results.get('error', 'Unknown error')} <<<")
-            else:
-                print("\n>>> Projection Analysis Skipped <<<")
-        else:
-            # 向后兼容旧格式
-            final_accuracy = results
-            print(f"\n>>> Final ZSL Accuracy: {final_accuracy:.2f}% <<<")
+        final_accuracy = fault_diagnosis.run_pipeline()
+        print(f"\n>>> Final ZSL Accuracy: {final_accuracy:.2f}% <<<")
